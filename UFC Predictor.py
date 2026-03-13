@@ -1211,21 +1211,62 @@ class UFCPredictor:
         print_section("BUILDING FEATURES (13+ TIERS)")
         df = self.df
 
-        # ── TIER 0: Raw column diffs ──────────────────────────────────────
+        # ── DROP LEAKY COLUMNS ────────────────────────────────────────────
+        # These columns are either in-fight statistics (only known after the
+        # fight ends) or post-fight career totals.  fix_data_leakage() has
+        # already consumed them to build the safe r_pre_* / b_pre_* columns.
+        # Leaving them in causes ~92% lab accuracy that collapses to ~54% on
+        # real upcoming-fight cards.
+        _LEAKY_COLS = [
+            # Per-fight striking / grappling stats (outcome of the fight itself)
+            "r_sig_str", "b_sig_str", "sig_str_diff",
+            "r_sig_str_att", "b_sig_str_att", "sig_str_att_diff",
+            "r_sig_str_acc", "b_sig_str_acc", "sig_str_acc_diff",
+            "r_str", "b_str", "str_diff",
+            "r_str_att", "b_str_att", "str_att_diff",
+            "r_str_acc", "b_str_acc", "str_acc_diff",
+            "r_kd", "b_kd", "kd_diff",
+            "r_head", "b_head", "head_diff",
+            "r_body", "b_body", "body_diff",
+            "r_leg", "b_leg", "leg_diff",
+            "r_distance", "b_distance", "distance_diff",
+            "r_clinch", "b_clinch", "clinch_diff",
+            "r_ground", "b_ground", "ground_diff",
+            "r_td", "b_td", "td_diff",
+            "r_td_att", "b_td_att", "td_att_diff",
+            "r_td_acc", "b_td_acc", "td_acc_diff",
+            "r_sub_att", "b_sub_att", "sub_att_diff",
+            "r_rev", "b_rev", "rev_diff",
+            "r_ctrl_sec", "b_ctrl_sec", "ctrl_sec_diff",
+            "total_fight_time_sec",
+            # Post-fight win/loss totals (pre-fight versions are r_pre_wins etc.)
+            "r_wins", "b_wins", "wins_diff",
+            "r_losses", "b_losses", "losses_diff",
+            "r_draws", "b_draws", "draws_diff",
+            "r_win_loss_ratio", "b_win_loss_ratio", "win_loss_ratio_diff",
+            # UFC published career averages (may include current fight;
+            # pre-fight versions are r_pre_SLpM, r_pre_sig_str_acc, etc.)
+            "r_pro_SLpM", "b_pro_SLpM", "pro_SLpM_diff",
+            "r_pro_sig_str_acc", "b_pro_sig_str_acc", "pro_sig_str_acc_diff",
+            "r_pro_SApM", "b_pro_SApM", "pro_SApM_diff",
+            "r_pro_str_def", "b_pro_str_def", "pro_str_def_diff",
+            "r_pro_td_avg", "b_pro_td_avg", "pro_td_avg_diff",
+            "r_pro_td_acc", "b_pro_td_acc", "pro_td_acc_diff",
+            "r_pro_td_def", "b_pro_td_def", "pro_td_def_diff",
+            "r_pro_sub_avg", "b_pro_sub_avg", "pro_sub_avg_diff",
+        ]
+        _leaky_present = [c for c in _LEAKY_COLS if c in df.columns]
+        self.df = df = df.drop(columns=_leaky_present)
+        print_step(f"Dropped {len(_leaky_present)} leaky in-fight columns.")
+
+        # ── TIER 0: Raw column diffs (safe physical attributes only) ──────
         self._log("Tier 0: Raw column differences...")
         raw_pairs = [
-            ("r_wins", "b_wins"), ("r_losses", "b_losses"),
-            ("r_draws", "b_draws"),
+            # Physical / biographical — available before the fight
             ("r_height", "b_height"), ("r_reach", "b_reach"),
             ("r_weight", "b_weight"),
             ("r_age_at_event", "b_age_at_event"),
             ("r_ape_index", "b_ape_index"),
-            ("r_pro_SLpM", "b_pro_SLpM"), ("r_pro_SApM", "b_pro_SApM"),
-            ("r_pro_sig_str_acc", "b_pro_sig_str_acc"),
-            ("r_pro_str_def", "b_pro_str_def"),
-            ("r_pro_td_avg", "b_pro_td_avg"), ("r_pro_td_acc", "b_pro_td_acc"),
-            ("r_pro_td_def", "b_pro_td_def"), ("r_pro_sub_avg", "b_pro_sub_avg"),
-            ("r_win_loss_ratio", "b_win_loss_ratio"),
         ]
         for rc, bc in raw_pairs:
             if rc in df.columns and bc in df.columns:
@@ -1866,8 +1907,8 @@ class UFCPredictor:
         b_td_t21    = df.get("b_pre_td_avg",        pd.Series(1.5,  index=df.index)).fillna(1.5)
         r_td_def_t21= df.get("r_pre_td_def",        pd.Series(0.65, index=df.index)).fillna(0.65)
         b_td_def_t21= df.get("b_pre_td_def",        pd.Series(0.65, index=df.index)).fillna(0.65)
-        r_sub_avg_t21 = df.get("r_pro_sub_avg",     pd.Series(0.3,  index=df.index)).fillna(0.3)
-        b_sub_avg_t21 = df.get("b_pro_sub_avg",     pd.Series(0.3,  index=df.index)).fillna(0.3)
+        r_sub_avg_t21 = df.get("r_pre_sub_att_rate", pd.Series(0.3,  index=df.index)).fillna(0.3)
+        b_sub_avg_t21 = df.get("b_pre_sub_att_rate", pd.Series(0.3,  index=df.index)).fillna(0.3)
         r_td_acc_t21= df.get("r_pre_td_acc",        pd.Series(0.4,  index=df.index)).fillna(0.4)
         b_td_acc_t21= df.get("b_pre_td_acc",        pd.Series(0.4,  index=df.index)).fillna(0.4)
         r_ctrl_t21  = df.get("r_pre_ctrl_avg",      pd.Series(60,   index=df.index)).fillna(60)
@@ -2299,11 +2340,13 @@ class UFCPredictor:
 
         # Build X, y
         df_train = self.df.copy()
-        # Temporal split: 85% train, 15% val (no data augmentation rows in val)
+        # Temporal 3-way split: 80% train / 10% val (weight optimisation) / 10% holdout test
         n = len(df_train)
-        split_idx = int(n * 0.85)
-        df_tr = df_train.iloc[:split_idx]
-        df_val = df_train.iloc[split_idx:]
+        train_end = int(n * 0.80)
+        val_end   = int(n * 0.90)
+        df_tr   = df_train.iloc[:train_end]
+        df_val  = df_train.iloc[train_end:val_end]
+        df_test = df_train.iloc[val_end:]
 
         # Corner-swap augmentation on train set
         df_aug = self._corner_swap(df_tr)
@@ -2315,6 +2358,7 @@ class UFCPredictor:
 
         print_metric("Train samples (augmented):", len(X_tr))
         print_metric("Val samples:", len(X_val))
+        print_metric("Test samples (holdout):", len(df_test))
         print_metric("Features:", len(feat_cols))
 
         # ── Antisymmetric feature decomposition (D + I) ───────────────────
@@ -2336,20 +2380,32 @@ class UFCPredictor:
         X_val_swap_df = df_val_swap[feat_col_list].fillna(0)
         X_val_decomposed = self._decompose_features(X_val_orig_df, X_val_swap_df)
 
+        # Build test decomposed features
+        df_test_feat = df_test.copy()
+        df_test_swap = self._corner_swap(df_test_feat)
+        X_test_orig_df = df_test_feat[feat_col_list].fillna(0)
+        X_test_swap_df = df_test_swap[feat_col_list].fillna(0)
+        X_test_decomposed = self._decompose_features(X_test_orig_df, X_test_swap_df)
+
         # Use decomposed arrays going forward
-        X_tr_raw = X_decomposed.values
-        X_val_raw = X_val_decomposed.values
-        y_tr = np.array([1 if w == "Red" else 0 for w in df_train_feat["winner"].values])
+        X_tr_raw   = X_decomposed.values
+        X_val_raw  = X_val_decomposed.values
+        X_test_raw = X_test_decomposed.values
+        y_tr   = np.array([1 if w == "Red" else 0 for w in df_train_feat["winner"].values])
+        y_val  = np.array([1 if w == "Red" else 0 for w in df_val_feat["winner"].values])
+        y_test = np.array([1 if w == "Red" else 0 for w in df_test_feat["winner"].values])
 
         # Scale
-        X_tr_s = self.scaler.fit_transform(X_tr_raw)
-        X_val_s = self.scaler.transform(X_val_raw)
+        X_tr_s   = self.scaler.fit_transform(X_tr_raw)
+        X_val_s  = self.scaler.transform(X_val_raw)
+        X_test_s = self.scaler.transform(X_test_raw)
 
         # Track D-feature indices (no _inv suffix) for corner bias diagnostic
         self._d_indices = [i for i, c in enumerate(self._decomposed_cols) if not c.endswith('_inv')]
 
-        X_tr_sel = X_tr_s
-        X_val_sel = X_val_s
+        X_tr_sel   = X_tr_s
+        X_val_sel  = X_val_s
+        X_test_sel = X_test_s
 
         # ── TimeSeriesSplit cross-validation ──────────────────────────────
         t0_cv = time.time()
@@ -2375,9 +2431,9 @@ class UFCPredictor:
 
             def optuna_objective(trial):
                 params = {
-                    'n_estimators': trial.suggest_int('n_estimators', 300, 1500),
+                    'n_estimators': trial.suggest_int('n_estimators', 300, 2000),
                     'max_depth': trial.suggest_int('max_depth', 3, 10),
-                    'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.1, log=True),
+                    'learning_rate': trial.suggest_float('learning_rate', 0.005, 0.1, log=True),
                     'subsample': trial.suggest_float('subsample', 0.6, 1.0),
                     'colsample_bytree': trial.suggest_float('colsample_bytree', 0.5, 1.0),
                     'reg_alpha': trial.suggest_float('reg_alpha', 0.0, 5.0),
@@ -2521,8 +2577,8 @@ class UFCPredictor:
             inner = getattr(self.stacking_clf, "estimator", None)
             if inner is None and hasattr(self.stacking_clf, "calibrated_classifiers_"):
                 inner = self.stacking_clf.calibrated_classifiers_[0].estimator
-            if inner is not None and hasattr(inner, "estimators_"):
-                for est_name, est in inner.estimators_:
+            if inner is not None and hasattr(inner, "named_estimators_"):
+                for est_name, est in inner.named_estimators_.items():
                     try:
                         est_pred = est.predict(X_val_sel)
                         est_acc  = accuracy_score(y_val, est_pred)
@@ -2538,8 +2594,8 @@ class UFCPredictor:
                            getattr(self.stacking_clf, "base_estimator", None)
             if winner_inner is None and hasattr(self.stacking_clf, "calibrated_classifiers_"):
                 winner_inner = self.stacking_clf.calibrated_classifiers_[0].estimator
-            if winner_inner is not None and hasattr(winner_inner, "estimators_"):
-                for name, est in winner_inner.estimators_:
+            if winner_inner is not None and hasattr(winner_inner, "named_estimators_"):
+                for name, est in winner_inner.named_estimators_.items():
                     if hasattr(est, "feature_importances_"):
                         imp = est.feature_importances_
                         top_idx = np.argsort(imp)[-20:][::-1]
@@ -2554,6 +2610,27 @@ class UFCPredictor:
         # ── Corner bias diagnostic ────────────────────────────────────────
         print_step("Running corner bias diagnostic...")
         self._corner_bias_diagnostic(X_val_sel, y_val)
+
+        # ── Holdout test set evaluation (never used in any optimisation step) ──
+        print_section("WINNER MODEL — HOLDOUT TEST SET METRICS")
+        try:
+            test_pred  = self.stacking_clf.predict(X_test_sel)
+            test_proba = self.stacking_clf.predict_proba(X_test_sel)
+            classes_t  = list(self.stacking_clf.classes_)
+            r_idx_t    = classes_t.index(1) if 1 in classes_t else 1
+            test_proba_pos = test_proba[:, r_idx_t]
+
+            test_acc = accuracy_score(y_test, test_pred)
+            test_ll  = log_loss(y_test, np.column_stack([1.0 - test_proba_pos, test_proba_pos]))
+            majority_acc_t = max(np.mean(y_test == 1), np.mean(y_test == 0))
+
+            print_metric("Test Accuracy:",           f"{test_acc:.4f}")
+            print_metric("Test Log-Loss:",           f"{test_ll:.4f}")
+            print_metric("Test samples:",            len(y_test))
+            print_metric("Majority-class baseline:", f"{majority_acc_t:.4f}")
+            print_metric("Lift over baseline:",      f"{test_acc - majority_acc_t:+.4f}")
+        except Exception as _e:
+            print(f"  (test metrics unavailable: {_e})")
 
         # ── Method classifier ─────────────────────────────────────────────
         self._log("Training method classifier (Decision/KO/Submission)...")
@@ -2809,18 +2886,11 @@ class UFCPredictor:
 
         # ── TIER 0: Raw column diffs ──────────────────────────────────────────
         raw_pairs = [
-            ("r_wins", "b_wins"), ("r_losses", "b_losses"),
-            ("r_draws", "b_draws"),
+            # Physical / biographical — available before the fight
             ("r_height", "b_height"), ("r_reach", "b_reach"),
             ("r_weight", "b_weight"),
             ("r_age_at_event", "b_age_at_event"),
             ("r_ape_index", "b_ape_index"),
-            ("r_pro_SLpM", "b_pro_SLpM"), ("r_pro_SApM", "b_pro_SApM"),
-            ("r_pro_sig_str_acc", "b_pro_sig_str_acc"),
-            ("r_pro_str_def", "b_pro_str_def"),
-            ("r_pro_td_avg", "b_pro_td_avg"), ("r_pro_td_acc", "b_pro_td_acc"),
-            ("r_pro_td_def", "b_pro_td_def"), ("r_pro_sub_avg", "b_pro_sub_avg"),
-            ("r_win_loss_ratio", "b_win_loss_ratio"),
         ]
         for rc, bc in raw_pairs:
             if rc in df.columns and bc in df.columns:
@@ -3328,8 +3398,8 @@ class UFCPredictor:
         b_td_t21     = df.get("b_pre_td_avg",         pd.Series(1.5,  index=df.index)).fillna(1.5)
         r_td_def_t21 = df.get("r_pre_td_def",         pd.Series(0.65, index=df.index)).fillna(0.65)
         b_td_def_t21 = df.get("b_pre_td_def",         pd.Series(0.65, index=df.index)).fillna(0.65)
-        r_sub_avg_t21= df.get("r_pro_sub_avg",        pd.Series(0.3,  index=df.index)).fillna(0.3)
-        b_sub_avg_t21= df.get("b_pro_sub_avg",        pd.Series(0.3,  index=df.index)).fillna(0.3)
+        r_sub_avg_t21= df.get("r_pre_sub_att_rate",   pd.Series(0.3,  index=df.index)).fillna(0.3)
+        b_sub_avg_t21= df.get("b_pre_sub_att_rate",   pd.Series(0.3,  index=df.index)).fillna(0.3)
         r_td_acc_t21 = df.get("r_pre_td_acc",         pd.Series(0.4,  index=df.index)).fillna(0.4)
         b_td_acc_t21 = df.get("b_pre_td_acc",         pd.Series(0.4,  index=df.index)).fillna(0.4)
         r_ctrl_t21   = df.get("r_pre_ctrl_avg",       pd.Series(60.0, index=df.index)).fillna(60)
