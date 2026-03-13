@@ -30,10 +30,8 @@ import numpy as np
 import pandas as pd
 from sklearn.ensemble import RandomForestClassifier, VotingClassifier
 from sklearn.linear_model import LogisticRegression
-from sklearn.neural_network import MLPClassifier
 from sklearn.preprocessing import StandardScaler, LabelEncoder
 from sklearn.decomposition import TruncatedSVD
-from sklearn.feature_selection import SelectPercentile, f_classif
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.cluster import KMeans
 from sklearn.metrics import accuracy_score, log_loss
@@ -2498,6 +2496,62 @@ class UFCPredictor:
             if not HAS_OPTUNA:
                 print_step("Optuna not available — using default XGBoost params")
 
+        # ── Optuna hyperparameter tuning for LightGBM ─────────────────────
+        if HAS_OPTUNA and HAS_LGB:
+            print_step("Running Optuna hyperparameter search for LightGBM (10 trials)...")
+            lgb_optuna_start = time.time()
+            LGB_TRIALS = 10
+
+            def lgb_optuna_objective(trial):
+                params = {
+                    "n_estimators": trial.suggest_int("n_estimators", 200, 1000),
+                    "num_leaves": trial.suggest_int("num_leaves", 15, 63),
+                    "max_depth": trial.suggest_int("max_depth", 3, 8),
+                    "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.1, log=True),
+                    "min_child_samples": trial.suggest_int("min_child_samples", 15, 50),
+                    "reg_alpha": trial.suggest_float("reg_alpha", 0.0, 5.0),
+                    "reg_lambda": trial.suggest_float("reg_lambda", 0.0, 5.0),
+                    "colsample_bytree": trial.suggest_float("colsample_bytree", 0.5, 1.0),
+                    "subsample": trial.suggest_float("subsample", 0.6, 1.0),
+                }
+                lgb_trial = lgb.LGBMClassifier(
+                    **params,
+                    random_state=42, verbose=-1,
+                    n_jobs=SAFE_N_JOBS, class_weight="balanced",
+                )
+                tscv3 = TimeSeriesSplit(n_splits=3)
+                scores = []
+                for tr_i, val_i in tscv3.split(X_tr_sel):
+                    lgb_trial.fit(X_tr_sel[tr_i], y_tr[tr_i])
+                    p = lgb_trial.predict_proba(X_tr_sel[val_i])[:, 1]
+                    scores.append(-log_loss(y_tr[val_i], p))
+                return np.mean(scores)
+
+            lgb_study = optuna.create_study(direction="maximize")
+            _lgb_trials_done = [0]
+
+            def _lgb_callback(study, trial):
+                _lgb_trials_done[0] += 1
+                best_val = -study.best_value if study.best_value is not None else float("nan")
+                bar_fill = int(_lgb_trials_done[0] / LGB_TRIALS * 30)
+                bar = "█" * bar_fill + "░" * (30 - bar_fill)
+                pct = int(_lgb_trials_done[0] / LGB_TRIALS * 100)
+                print(f"\r  [{bar}] {pct:3d}%  trial {_lgb_trials_done[0]:2d}/{LGB_TRIALS}"
+                      f"  best log-loss: {best_val:.4f}", end="", flush=True)
+
+            lgb_study.optimize(
+                lgb_optuna_objective, n_trials=LGB_TRIALS,
+                show_progress_bar=False, callbacks=[_lgb_callback],
+            )
+            print()
+            lgb_best_params = lgb_study.best_params
+            lgb_elapsed = time.time() - lgb_optuna_start
+            print_metric("LGB Optuna best log-loss:", f"{-lgb_study.best_value:.4f}")
+            print_metric("Time elapsed:", f"{lgb_elapsed:.1f}s")
+            self._optuna_best_lgb_params = lgb_best_params
+        else:
+            self._optuna_best_lgb_params = {}
+
         # Build base estimators
         t0_estimators = time.time()
         estimators = self._build_estimators(X_tr_sel, y_tr)
@@ -2515,23 +2569,31 @@ class UFCPredictor:
             except Exception:
                 _val_probas.append(np.full(len(y_val), 0.5))
 
-        # Optimize per-model weights on validation log-loss
+        # Optimize per-model weights on validation log-loss.
+        # L-BFGS-B with a lower bound of 0.05 per model ensures every estimator
+        # contributes at least minimally — Nelder-Mead (unconstrained) collapsed
+        # RF/MLP/CAT weights to zero, discarding useful ensemble diversity.
         _opt_weights = None
+        _n_estimators = len(estimators)
         if len(_val_probas) >= 2:
             try:
                 from scipy.optimize import minimize as _scipy_minimize
                 def _voting_ll(w):
-                    w_abs = np.abs(w)
-                    w_sum = w_abs.sum() + 1e-10
-                    p = sum(wi * pi for wi, pi in zip(w_abs, _val_probas)) / w_sum
+                    w_sum = w.sum() + 1e-10
+                    p = sum(wi * pi for wi, pi in zip(w, _val_probas)) / w_sum
                     p = np.clip(p, 1e-7, 1.0 - 1e-7)
                     return log_loss(y_val, np.column_stack([1.0 - p, p]))
+                # Each model must receive at least 5% of the total weight
+                _bounds = [(0.05, None)] * _n_estimators
                 _res = _scipy_minimize(
-                    _voting_ll, x0=np.ones(len(_val_probas)),
-                    method="Nelder-Mead", options={"maxiter": 1000, "xatol": 1e-4}
+                    _voting_ll, x0=np.ones(_n_estimators),
+                    method="L-BFGS-B", bounds=_bounds,
+                    options={"maxiter": 500}
                 )
-                _opt_weights = np.abs(_res.x).tolist()
-                print_metric("Optimized voting weights:", str([f"{w:.3f}" for w in _opt_weights]))
+                _opt_weights = _res.x.tolist()
+                _names = [n for n, _ in estimators]
+                print_metric("Optimized voting weights:",
+                             str([f"{n}:{w:.3f}" for n, w in zip(_names, _opt_weights)]))
                 print_metric("Weighted val log-loss:", f"{_res.fun:.4f}")
             except Exception as _we:
                 self._log(f"Weight optimization failed ({_we}), using equal weights")
@@ -2541,7 +2603,7 @@ class UFCPredictor:
             weights=_opt_weights, n_jobs=1
         )
         voting.fit(X_tr_sel, y_tr)
-        self.stacking_clf = CalibratedClassifierCV(voting, method="isotonic", cv=5)
+        self.stacking_clf = CalibratedClassifierCV(voting, method="isotonic", cv=3)
         self.stacking_clf.fit(X_tr_sel, y_tr)
         # Ensure n_jobs=1 on the fitted estimator so predict_proba never spawns
         # worker processes from the GUI background thread (deadlocks on Windows)
@@ -2674,12 +2736,17 @@ class UFCPredictor:
         print_metric("  Max parity error:", f"{max_error:.4f}")
         print_metric("  Inherent red bias:", f"{red_bias:+.4f} ({red_bias*100:+.2f}%)")
 
-        if abs(red_bias) < 0.02:
-            print("  GOOD: Bias < 2% -- Model learned fighter skill, not corner position")
-        elif abs(red_bias) < 0.05:
-            print("  MODERATE: Bias 2-5% -- Some corner learning present")
+        # UFC books better-ranked fighter red, so ~56-58% red wins is real.
+        # A model bias of ~3-6% is therefore expected legitimate signal.
+        if abs(red_bias) < 0.03:
+            print("  GOOD: Bias < 3% -- Consistent with fighter skill signal")
+        elif abs(red_bias) < 0.07:
+            print("  NOTE: Bias 3-7% -- Consistent with real UFC red-corner advantage (~56-58% red wins)")
         else:
-            print("  WARNING: Bias > 5% -- Model may have learned corner position!")
+            print("  WARNING: Bias > 7% -- Model may have over-learned corner position!")
+
+        # Store for informational tracking (not used to adjust predictions)
+        self._red_corner_bias = red_bias
 
         return mean_error, max_error, red_bias
 
@@ -3757,6 +3824,8 @@ class UFCPredictor:
 
     def _build_estimators(self, X_tr, y_tr):
         from sklearn.pipeline import Pipeline as _Pipeline
+        from sklearn.feature_selection import SelectPercentile, f_classif
+        from sklearn.neural_network import MLPClassifier
 
         estimators = []
 
@@ -3766,9 +3835,12 @@ class UFCPredictor:
         spw = n_neg / n_pos  # >1 means red wins are minority (typical UFC dataset)
         print_metric("Class ratio (neg/pos):", f"{spw:.3f}")
 
-        # LogisticRegression (linear base learner — key ensemble diversity vs tree models)
+        # LogisticRegression — SelectPercentile reduces 1200 decomposed features to
+        # the top 40% (~480) by ANOVA F-score before the linear model sees them.
+        # Linear models degrade badly in very high-dimensional noisy spaces.
         lr_pipe = _Pipeline([
             ("scaler", StandardScaler()),
+            ("selector", SelectPercentile(f_classif, percentile=40)),
             ("lr", LogisticRegression(
                 C=0.1, max_iter=1000, random_state=RANDOM_SEED,
                 n_jobs=SAFE_N_JOBS, class_weight="balanced", solver="lbfgs",
@@ -3776,30 +3848,6 @@ class UFCPredictor:
         ])
         lr_pipe.fit(X_tr, y_tr)
         estimators.append(("lr", lr_pipe))
-
-        # Random Forest (always available)
-        rf = RandomForestClassifier(
-            n_estimators=300, max_depth=None, min_samples_split=4,
-            min_samples_leaf=2, max_features="sqrt",
-            random_state=RANDOM_SEED, n_jobs=1, class_weight="balanced"
-        )
-        rf.fit(X_tr, y_tr)
-        estimators.append(("rf", rf))
-
-        # MLP — wrapped with its own SelectPercentile since it's sensitive to
-        # irrelevant/correlated features unlike the tree models.
-        mlp_pipe = _Pipeline([
-            ("selector", SelectPercentile(f_classif, percentile=70)),
-            ("mlp", MLPClassifier(
-                hidden_layer_sizes=(256, 128, 64), activation="relu",
-                solver="adam", alpha=1e-4, batch_size=64,
-                learning_rate_init=1e-3, max_iter=300,
-                early_stopping=True, validation_fraction=0.1,
-                random_state=RANDOM_SEED
-            )),
-        ])
-        mlp_pipe.fit(X_tr, y_tr)
-        estimators.append(("mlp", mlp_pipe))
 
         # XGBoost — conservative regularization defaults (Optuna overrides if available)
         if HAS_XGB:
@@ -3821,19 +3869,45 @@ class UFCPredictor:
             clf.fit(X_tr, y_tr)
             estimators.append(("xgb", clf))
 
-        # LightGBM
+        # LightGBM — Optuna-tuned params used if available, else conservative defaults
         if HAS_LGB:
             lgb_params = {
-                "n_estimators": 500, "num_leaves": 63, "max_depth": -1,
+                "n_estimators": 500, "num_leaves": 31, "max_depth": -1,
                 "learning_rate": 0.05, "subsample": 0.8,
-                "colsample_bytree": 0.8, "min_child_samples": 20,
-                "reg_alpha": 0.1, "reg_lambda": 0.1,
+                "colsample_bytree": 0.8, "min_child_samples": 30,
+                "reg_alpha": 0.5, "reg_lambda": 1.0,
                 "random_state": RANDOM_SEED, "verbose": -1,
                 "n_jobs": SAFE_N_JOBS, "class_weight": "balanced",
             }
+            if hasattr(self, '_optuna_best_lgb_params') and self._optuna_best_lgb_params:
+                lgb_params.update(self._optuna_best_lgb_params)
             clf = lgb.LGBMClassifier(**lgb_params)
             clf.fit(X_tr, y_tr)
             estimators.append(("lgb", clf))
+
+        # Random Forest
+        rf = RandomForestClassifier(
+            n_estimators=300, max_depth=None, min_samples_split=4,
+            min_samples_leaf=2, max_features="sqrt",
+            random_state=RANDOM_SEED, n_jobs=1, class_weight="balanced"
+        )
+        rf.fit(X_tr, y_tr)
+        estimators.append(("rf", rf))
+
+        # MLP — SelectPercentile reduces 1200 features to ~480 so the network
+        # doesn't collapse under high-dimensional noise
+        mlp_pipe = _Pipeline([
+            ("selector", SelectPercentile(f_classif, percentile=40)),
+            ("mlp", MLPClassifier(
+                hidden_layer_sizes=(256, 128, 64), activation="relu",
+                solver="adam", alpha=5e-4, batch_size=64,
+                learning_rate_init=1e-3, max_iter=300,
+                early_stopping=True, validation_fraction=0.1,
+                random_state=RANDOM_SEED
+            )),
+        ])
+        mlp_pipe.fit(X_tr, y_tr)
+        estimators.append(("mlp", mlp_pipe))
 
         # CatBoost — balanced class weighting
         if HAS_CAT:
@@ -3891,7 +3965,6 @@ class UFCPredictor:
         X_val_sel = self.method_scaler.transform(X_val)
 
         # Phase 5: Method ensemble with stacking
-        from sklearn.pipeline import Pipeline as _Pipeline
         method_estimators = []
 
         if HAS_XGB:
@@ -3924,12 +3997,20 @@ class UFCPredictor:
                 cat_m_params["task_type"] = "GPU"
             method_estimators.append(("cat_m", cb.CatBoostClassifier(**cat_m_params)))
 
-        method_estimators.append(("rf_m", RandomForestClassifier(
-            n_estimators=400, max_depth=10, n_jobs=1, random_state=42
+        from sklearn.pipeline import Pipeline as _Pipeline
+        from sklearn.neural_network import MLPClassifier
+        from sklearn.feature_selection import SelectPercentile, f_classif
+        from sklearn.ensemble import RandomForestClassifier as _RFC
+        method_estimators.append(("rf_m", _RFC(
+            n_estimators=300, max_depth=10, n_jobs=1, random_state=42,
+            class_weight="balanced"
         )))
         method_estimators.append(("mlp_m", _Pipeline([
-            ("selector", SelectPercentile(f_classif, percentile=65)),
-            ("mlp", MLPClassifier(hidden_layer_sizes=(256, 128, 64), max_iter=300, random_state=42)),
+            ("selector", SelectPercentile(f_classif, percentile=40)),
+            ("mlp", MLPClassifier(
+                hidden_layer_sizes=(256, 128, 64), max_iter=300,
+                alpha=5e-4, early_stopping=True, random_state=42
+            )),
         ])))
 
         t0_method = time.time()
