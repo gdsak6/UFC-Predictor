@@ -2779,20 +2779,15 @@ class UFCPredictor:
             print_metric("Majority-class baseline:", f"{majority_acc:.4f}")
             print_metric("Lift over baseline:",   f"{val_acc - majority_acc:+.4f}")
 
-            # Per-model breakdown — look for named_estimators_ on the stacking
-            # clf itself (StackingClassifier) or inside a calibration wrapper.
+            # Per-model breakdown
             print_step("Per-estimator val accuracy:")
-            _ne_source = None
-            if hasattr(self.stacking_clf, "named_estimators_"):
-                _ne_source = self.stacking_clf  # direct StackingClassifier
-            else:
-                _inner = getattr(self.stacking_clf, "estimator", None)
-                if _inner is None and hasattr(self.stacking_clf, "calibrated_classifiers_"):
-                    _inner = self.stacking_clf.calibrated_classifiers_[0].estimator
-                if _inner is not None and hasattr(_inner, "named_estimators_"):
-                    _ne_source = _inner
-            if _ne_source is not None:
-                for est_name, est in _ne_source.named_estimators_.items():
+            _base_ests = None
+            if isinstance(self.stacking_clf, _ManualStackingEnsemble):
+                _base_ests = self.stacking_clf.estimators  # list of (name, est)
+            elif hasattr(self.stacking_clf, "named_estimators_"):
+                _base_ests = list(self.stacking_clf.named_estimators_.items())
+            if _base_ests is not None:
+                for est_name, est in _base_ests:
                     try:
                         est_pred = est.predict(X_val_sel)
                         est_acc  = accuracy_score(y_val, est_pred)
@@ -2808,18 +2803,18 @@ class UFCPredictor:
             _feat_names = (getattr(self, '_selected_decomposed_cols', None) or
                            getattr(self, '_decomposed_cols', None) or
                            self.feature_cols)
-            # Prefer the full-training _base_ensemble; fall back to calibration wrapper.
+            # Resolve base estimator list — handles _ManualStackingEnsemble and
+            # StackingClassifier (and calibration wrappers around either).
+            _fi_ests = None
             winner_inner = getattr(self, '_base_ensemble', None)
-            if winner_inner is None:
-                winner_inner = getattr(self.stacking_clf, "estimator", None) or \
-                               getattr(self.stacking_clf, "base_estimator", None)
-            if winner_inner is None and hasattr(self.stacking_clf, "calibrated_classifiers_"):
-                winner_inner = self.stacking_clf.calibrated_classifiers_[0].estimator
-            # StackingClassifier exposes named_estimators_ directly
-            if winner_inner is None and hasattr(self.stacking_clf, "named_estimators_"):
-                winner_inner = self.stacking_clf
-            if winner_inner is not None and hasattr(winner_inner, "named_estimators_"):
-                for _model_name, _est in winner_inner.named_estimators_.items():
+            if isinstance(winner_inner, _ManualStackingEnsemble):
+                _fi_ests = winner_inner.estimators   # list of (name, est)
+            elif winner_inner is not None and hasattr(winner_inner, "named_estimators_"):
+                _fi_ests = list(winner_inner.named_estimators_.items())
+            elif hasattr(self.stacking_clf, "named_estimators_"):
+                _fi_ests = list(self.stacking_clf.named_estimators_.items())
+            if _fi_ests is not None:
+                for _model_name, _est in _fi_ests:
                     # Unwrap Pipeline to get the underlying estimator's importances
                     _base = _est
                     if hasattr(_est, 'named_steps'):
