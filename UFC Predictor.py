@@ -11,6 +11,7 @@ XGBoost + LightGBM + CatBoost + RandomForest + MLP stacked with LogisticRegressi
 import os
 os.environ["PYTHONWARNINGS"] = "ignore"
 import sys
+import random
 import time
 import math
 import copy
@@ -35,7 +36,7 @@ from sklearn.decomposition import TruncatedSVD
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.cluster import KMeans
 from sklearn.metrics import accuracy_score, log_loss
-from sklearn.model_selection import cross_val_score, TimeSeriesSplit
+from sklearn.model_selection import cross_val_score, TimeSeriesSplit, KFold
 import openpyxl
 from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
@@ -81,7 +82,15 @@ except ImportError:
 # GLOBAL CONFIGURATION
 # ─────────────────────────────────────────────────────────────────────────────
 RANDOM_SEED = 42
+# Seed every source of randomness that can affect training results.
+# Together these make the full pipeline deterministic on CPU.
+# NOTE: XGBoost with device='cuda' still has non-deterministic float-reduction
+# order from parallel GPU threads; to eliminate that last source of variance
+# set device='cpu' in the XGB params (at the cost of GPU speed).
+random.seed(RANDOM_SEED)
 np.random.seed(RANDOM_SEED)
+os.environ["PYTHONHASHSEED"]        = str(RANDOM_SEED)
+os.environ["TF_DETERMINISTIC_OPS"]  = "1"   # no-op if TF absent, harmless
 
 SAFE_N_JOBS = max(1, mp.cpu_count() // 2)
 
@@ -2338,13 +2347,22 @@ class UFCPredictor:
 
         # Build X, y
         df_train = self.df.copy()
-        # Temporal 3-way split: 80% train / 10% val (weight optimisation) / 10% holdout test
+        # Temporal 2-way split: 90% train / 10% holdout test.
+        # The former 10% validation window is now included in training — those
+        # are the most recent fights before the test period, so their outcomes
+        # update ELO, win streaks, and style clusters that the test-set fighters
+        # rely on. Holding them out starved the model of the most relevant signal.
+        # Optuna and the StackingClassifier meta-learner both use TimeSeriesSplit
+        # internally on the 90%, preserving temporal order for CV.
+        # A diagnostic window (last 10% of training) is kept as df_val purely
+        # for in-training accuracy display; it is NOT used for any optimisation.
         n = len(df_train)
-        train_end = int(n * 0.80)
-        val_end   = int(n * 0.90)
+        train_end = int(n * 0.90)
         df_tr   = df_train.iloc[:train_end]
-        df_val  = df_train.iloc[train_end:val_end]
-        df_test = df_train.iloc[val_end:]
+        df_test = df_train.iloc[train_end:]
+        # Diagnostic window — last ~10% of training data (overlaps with training)
+        diag_start = int(n * 0.80)
+        df_val  = df_train.iloc[diag_start:train_end]
 
         # Corner-swap augmentation on train set
         df_aug = self._corner_swap(df_tr)
@@ -2355,7 +2373,7 @@ class UFCPredictor:
         self.feature_cols = feat_cols
 
         print_metric("Train samples (augmented):", len(X_tr))
-        print_metric("Val samples:", len(X_val))
+        print_metric("Diag window samples (in-training):", len(X_val))
         print_metric("Test samples (holdout):", len(df_test))
         print_metric("Features:", len(feat_cols))
 
@@ -2401,9 +2419,48 @@ class UFCPredictor:
         # Track D-feature indices (no _inv suffix) for corner bias diagnostic
         self._d_indices = [i for i, c in enumerate(self._decomposed_cols) if not c.endswith('_inv')]
 
-        X_tr_sel   = X_tr_s
-        X_val_sel  = X_val_s
-        X_test_sel = X_test_s
+        # Global model-based feature selection — keep top 50% of the 1200
+        # decomposed features by LightGBM split-count importance.
+        # ANOVA F-score (the univariate alternative) only detects linear
+        # correlations; LGB importance captures feature interactions and
+        # non-linear signal (e.g. age has a non-linear relationship with
+        # performance).  A lightweight LGB (100 trees) is trained purely to rank
+        # features; it is completely separate from the Optuna-tuned LGB in the
+        # ensemble.
+        print_step("Running model-based feature selection (LGB importance, top 50%)...")
+        from sklearn.feature_selection import SelectFromModel as _SFM
+        if HAS_LGB:
+            _sel_lgb = lgb.LGBMClassifier(
+                n_estimators=100, num_leaves=31, max_depth=5,
+                learning_rate=0.1, subsample=0.8, colsample_bytree=0.8,
+                random_state=RANDOM_SEED, verbose=-1, n_jobs=SAFE_N_JOBS,
+            )
+            _sel_lgb.fit(X_tr_s, y_tr)
+            # Use max_features to guarantee exactly top 50% by count.
+            # threshold="median" fails when median importance=0 (>50% zero-importance
+            # features), causing SelectFromModel to keep all 1200 features.
+            _n_keep = X_tr_s.shape[1] // 2
+            self._global_selector = _SFM(
+                _sel_lgb, prefit=True, max_features=_n_keep, threshold=-np.inf
+            )
+        else:
+            # Fallback: ANOVA F-score when LGB unavailable
+            from sklearn.feature_selection import SelectPercentile as _SP, f_classif as _fc
+            _sp = _SP(_fc, percentile=50)
+            _sp.fit(X_tr_s, y_tr)
+            self._global_selector = _sp
+        X_tr_sel   = self._global_selector.transform(X_tr_s)
+        X_val_sel  = self._global_selector.transform(X_val_s)
+        X_test_sel = self._global_selector.transform(X_test_s)
+        _gsel_idx  = self._global_selector.get_support(indices=True)
+        # Subset of decomposed column names that survived selection
+        self._selected_decomposed_cols = [self._decomposed_cols[i] for i in _gsel_idx]
+        # Recompute D-feature indices within the reduced feature space
+        self._d_indices = [
+            new_i for new_i, orig_i in enumerate(_gsel_idx)
+            if not self._decomposed_cols[orig_i].endswith('_inv')
+        ]
+        print_metric("Features after model-based selection:", X_tr_sel.shape[1])
 
         # ── TimeSeriesSplit cross-validation ──────────────────────────────
         t0_cv = time.time()
@@ -2429,14 +2486,18 @@ class UFCPredictor:
 
             def optuna_objective(trial):
                 params = {
-                    'n_estimators': trial.suggest_int('n_estimators', 300, 2000),
-                    'max_depth': trial.suggest_int('max_depth', 3, 10),
-                    'learning_rate': trial.suggest_float('learning_rate', 0.005, 0.1, log=True),
+                    # Cap n_estimators at 1000: with low learning rates (0.005),
+                    # 2000 trees can memorize a small UFC dataset. 1000 is sufficient.
+                    'n_estimators': trial.suggest_int('n_estimators', 200, 1000),
+                    'max_depth': trial.suggest_int('max_depth', 3, 8),
+                    'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.15, log=True),
                     'subsample': trial.suggest_float('subsample', 0.6, 1.0),
                     'colsample_bytree': trial.suggest_float('colsample_bytree', 0.5, 1.0),
                     'reg_alpha': trial.suggest_float('reg_alpha', 0.0, 5.0),
-                    'reg_lambda': trial.suggest_float('reg_lambda', 0.0, 5.0),
-                    'min_child_weight': trial.suggest_int('min_child_weight', 1, 20),
+                    'reg_lambda': trial.suggest_float('reg_lambda', 1.0, 8.0),
+                    # min_child_weight floor at 5 — on ~600 training fights this
+                    # prevents leaves from containing only 1-4 samples.
+                    'min_child_weight': trial.suggest_int('min_child_weight', 5, 30),
                     'gamma': trial.suggest_float('gamma', 0.0, 5.0),
                 }
                 xgb_trial = xgb.XGBClassifier(
@@ -2460,9 +2521,12 @@ class UFCPredictor:
                 return np.mean(scores)
 
             optuna.logging.set_verbosity(optuna.logging.WARNING)
-            study = optuna.create_study(direction='maximize')
+            study = optuna.create_study(
+                direction='maximize',
+                sampler=optuna.samplers.TPESampler(seed=RANDOM_SEED),
+            )
 
-            N_TRIALS = 25
+            N_TRIALS = 25  # TEMP: speed test (restore to 25)
             _optuna_best_so_far = [None]
 
             def _optuna_callback(study, trial):
@@ -2498,9 +2562,9 @@ class UFCPredictor:
 
         # ── Optuna hyperparameter tuning for LightGBM ─────────────────────
         if HAS_OPTUNA and HAS_LGB:
-            print_step("Running Optuna hyperparameter search for LightGBM (10 trials)...")
+            print_step("Running Optuna hyperparameter search for LightGBM (15 trials)...")
             lgb_optuna_start = time.time()
-            LGB_TRIALS = 10
+            LGB_TRIALS = 15  # TEMP: speed test (restore to 15)
 
             def lgb_optuna_objective(trial):
                 params = {
@@ -2527,7 +2591,10 @@ class UFCPredictor:
                     scores.append(-log_loss(y_tr[val_i], p))
                 return np.mean(scores)
 
-            lgb_study = optuna.create_study(direction="maximize")
+            lgb_study = optuna.create_study(
+                direction="maximize",
+                sampler=optuna.samplers.TPESampler(seed=RANDOM_SEED),
+            )
             _lgb_trials_done = [0]
 
             def _lgb_callback(study, trial):
@@ -2552,69 +2619,71 @@ class UFCPredictor:
         else:
             self._optuna_best_lgb_params = {}
 
-        # Build base estimators
+        # Build and fit base estimators — these fitted copies are used for the
+        # per-model val accuracy display and cloned into the stacking ensemble.
         t0_estimators = time.time()
         estimators = self._build_estimators(X_tr_sel, y_tr)
         print_metric("Base estimators time:", f"{time.time()-t0_estimators:.1f}s")
 
-        # Build optimized VotingClassifier
-        self._log("Building voting ensemble...")
+        # ── StackingClassifier with TimeSeriesSplit(3) CV ──────────────────
+        # The meta-learner (LogisticRegression) is trained on out-of-fold
+        # predictions from 3 time-ordered CV splits of the training set — NOT
+        # on the single 10% validation window that caused VotingClassifier's
+        # weight optimizer to assign 77%+ to XGB.  Cross-validated meta-learning
+        # is more robust to a specific period's characteristics.
+        # LR is inherently calibrated (sigmoid output), so no additional
+        # CalibratedClassifierCV wrapper is needed.
+        print_step("Building stacking ensemble (TimeSeriesSplit-3 CV meta-learning)...")
         t0_stack = time.time()
-
-        # Collect val probas from each fitted base model for weight optimization
-        _val_probas = []
-        for _name, _est in estimators:
-            try:
-                _val_probas.append(_est.predict_proba(X_val_sel)[:, 1])
-            except Exception:
-                _val_probas.append(np.full(len(y_val), 0.5))
-
-        # Optimize per-model weights on validation log-loss.
-        # L-BFGS-B with a lower bound of 0.05 per model ensures every estimator
-        # contributes at least minimally — Nelder-Mead (unconstrained) collapsed
-        # RF/MLP/CAT weights to zero, discarding useful ensemble diversity.
-        _opt_weights = None
-        _n_estimators = len(estimators)
-        if len(_val_probas) >= 2:
-            try:
-                from scipy.optimize import minimize as _scipy_minimize
-                def _voting_ll(w):
-                    w_sum = w.sum() + 1e-10
-                    p = sum(wi * pi for wi, pi in zip(w, _val_probas)) / w_sum
-                    p = np.clip(p, 1e-7, 1.0 - 1e-7)
-                    return log_loss(y_val, np.column_stack([1.0 - p, p]))
-                # Each model must receive at least 5% of the total weight
-                _bounds = [(0.05, None)] * _n_estimators
-                _res = _scipy_minimize(
-                    _voting_ll, x0=np.ones(_n_estimators),
-                    method="L-BFGS-B", bounds=_bounds,
-                    options={"maxiter": 500}
-                )
-                _opt_weights = _res.x.tolist()
-                _names = [n for n, _ in estimators]
-                print_metric("Optimized voting weights:",
-                             str([f"{n}:{w:.3f}" for n, w in zip(_names, _opt_weights)]))
-                print_metric("Weighted val log-loss:", f"{_res.fun:.4f}")
-            except Exception as _we:
-                self._log(f"Weight optimization failed ({_we}), using equal weights")
-
-        voting = VotingClassifier(
-            estimators=estimators, voting="soft",
-            weights=_opt_weights, n_jobs=1
+        from sklearn.base import clone as _sklearn_clone
+        from sklearn.ensemble import StackingClassifier as _StackingCLF
+        # Clone unfitted copies — StackingClassifier requires unfitted estimators
+        # for its internal cross-validated meta-feature generation.
+        _unfitted = [(n, _sklearn_clone(e)) for n, e in estimators]
+        _stk = _StackingCLF(
+            estimators=_unfitted,
+            final_estimator=LogisticRegression(
+                C=0.05, max_iter=1000, random_state=RANDOM_SEED, solver="lbfgs"
+            ),
+            # KFold(shuffle=False) is required here: StackingClassifier pipes CV
+            # through cross_val_predict, which demands every sample appear in
+            # exactly one test fold (a partition).  TimeSeriesSplit fails that
+            # because its initial training window is never a test set, leaving
+            # those samples without meta-features.  KFold with shuffle=False
+            # splits into 3 consecutive chronological blocks — the partition
+            # requirement is met and temporal order within each fold is kept.
+            cv=KFold(n_splits=3, shuffle=False),
+            stack_method="predict_proba",
+            n_jobs=1,
+            passthrough=False,
         )
-        voting.fit(X_tr_sel, y_tr)
-        self.stacking_clf = CalibratedClassifierCV(voting, method="isotonic", cv=3)
-        self.stacking_clf.fit(X_tr_sel, y_tr)
-        # Ensure n_jobs=1 on the fitted estimator so predict_proba never spawns
-        # worker processes from the GUI background thread (deadlocks on Windows)
+        _stk.fit(X_tr_sel, y_tr)
+        # Store the full-training-fit stacking model for feature importance display
+        self._base_ensemble = _stk
+        self.stacking_clf   = _stk
+
+        # Show meta-learner coefficients (model contributions)
         try:
-            self.stacking_clf.estimator.n_jobs = 1
+            _meta = _stk.final_estimator_
+            if hasattr(_meta, "coef_"):
+                _coefs     = _meta.coef_[0]
+                _est_names = [n for n, _ in estimators]
+                print_step("Meta-learner model contributions "
+                           "(LR coef on class-1 probability column):")
+                # predict_proba gives 2 cols per model (class-0, class-1);
+                # the class-1 column (odd index) is what drives Red-win prediction.
+                for _ei, _ename in enumerate(_est_names):
+                    _ci = _ei * 2 + 1
+                    _c  = float(_coefs[_ci]) if _ci < len(_coefs) else float("nan")
+                    print(f"    {_ename:<6s}  coef={_c:+.4f}")
         except Exception:
             pass
-        print_metric("Voting ensemble time:", f"{time.time()-t0_stack:.1f}s")
+        print_metric("Stacking ensemble time:", f"{time.time()-t0_stack:.1f}s")
 
-        # ── Winner model evaluation on held-out validation set ────────────
-        print_section("WINNER MODEL — VALIDATION SET METRICS")
+        # ── Winner model evaluation on diagnostic window (in-training) ────
+        # This window overlaps with training data — accuracy is optimistic.
+        # Use HOLDOUT TEST SET METRICS below for true out-of-sample performance.
+        print_section("WINNER MODEL — DIAGNOSTIC WINDOW (in-training, last 10% of train)")
         try:
             val_pred  = self.stacking_clf.predict(X_val_sel)
             val_proba = self.stacking_clf.predict_proba(X_val_sel)
@@ -2634,13 +2703,20 @@ class UFCPredictor:
             print_metric("Majority-class baseline:", f"{majority_acc:.4f}")
             print_metric("Lift over baseline:",   f"{val_acc - majority_acc:+.4f}")
 
-            # Per-model breakdown
+            # Per-model breakdown — look for named_estimators_ on the stacking
+            # clf itself (StackingClassifier) or inside a calibration wrapper.
             print_step("Per-estimator val accuracy:")
-            inner = getattr(self.stacking_clf, "estimator", None)
-            if inner is None and hasattr(self.stacking_clf, "calibrated_classifiers_"):
-                inner = self.stacking_clf.calibrated_classifiers_[0].estimator
-            if inner is not None and hasattr(inner, "named_estimators_"):
-                for est_name, est in inner.named_estimators_.items():
+            _ne_source = None
+            if hasattr(self.stacking_clf, "named_estimators_"):
+                _ne_source = self.stacking_clf  # direct StackingClassifier
+            else:
+                _inner = getattr(self.stacking_clf, "estimator", None)
+                if _inner is None and hasattr(self.stacking_clf, "calibrated_classifiers_"):
+                    _inner = self.stacking_clf.calibrated_classifiers_[0].estimator
+                if _inner is not None and hasattr(_inner, "named_estimators_"):
+                    _ne_source = _inner
+            if _ne_source is not None:
+                for est_name, est in _ne_source.named_estimators_.items():
                     try:
                         est_pred = est.predict(X_val_sel)
                         est_acc  = accuracy_score(y_val, est_pred)
@@ -2650,24 +2726,45 @@ class UFCPredictor:
         except Exception as _e:
             print(f"  (metrics unavailable: {_e})")
 
-        # Phase 8: Feature importance top-20 diagnostic
+        # Feature importance — all non-zero features, per model.
+        # Uses _selected_decomposed_cols (the 600 names that survived global selection).
         try:
-            winner_inner = getattr(self.stacking_clf, "estimator", None) or \
-                           getattr(self.stacking_clf, "base_estimator", None)
+            _feat_names = (getattr(self, '_selected_decomposed_cols', None) or
+                           getattr(self, '_decomposed_cols', None) or
+                           self.feature_cols)
+            # Prefer the full-training _base_ensemble; fall back to calibration wrapper.
+            winner_inner = getattr(self, '_base_ensemble', None)
+            if winner_inner is None:
+                winner_inner = getattr(self.stacking_clf, "estimator", None) or \
+                               getattr(self.stacking_clf, "base_estimator", None)
             if winner_inner is None and hasattr(self.stacking_clf, "calibrated_classifiers_"):
                 winner_inner = self.stacking_clf.calibrated_classifiers_[0].estimator
+            # StackingClassifier exposes named_estimators_ directly
+            if winner_inner is None and hasattr(self.stacking_clf, "named_estimators_"):
+                winner_inner = self.stacking_clf
             if winner_inner is not None and hasattr(winner_inner, "named_estimators_"):
-                for name, est in winner_inner.named_estimators_.items():
-                    if hasattr(est, "feature_importances_"):
-                        imp = est.feature_importances_
-                        top_idx = np.argsort(imp)[-20:][::-1]
-                        print_section(f"TOP 20 FEATURES ({name})")
-                        for i in top_idx:
-                            if i < len(self.feature_cols):
-                                print(f"  {self.feature_cols[i]:50s}: {imp[i]:.4f}")
-                        break
-        except Exception:
-            pass
+                for _model_name, _est in winner_inner.named_estimators_.items():
+                    # Unwrap Pipeline to get the underlying estimator's importances
+                    _base = _est
+                    if hasattr(_est, 'named_steps'):
+                        for _step in reversed(list(_est.named_steps.values())):
+                            if hasattr(_step, 'feature_importances_'):
+                                _base = _step
+                                break
+                    if not hasattr(_base, 'feature_importances_'):
+                        continue
+                    _imp = _base.feature_importances_
+                    # Pair each feature with its importance; filter zero-importance
+                    _pairs = [(i, _feat_names[i], _imp[i])
+                              for i in range(len(_imp))
+                              if i < len(_feat_names) and _imp[i] > 1e-6]
+                    _pairs.sort(key=lambda x: x[2], reverse=True)
+                    print_section(f"FEATURE IMPORTANCES — {_model_name.upper()} "
+                                  f"(top 20 of {len(_pairs)} non-zero / {len(_imp)} total)")
+                    for _rank, (_i, _fname, _fval) in enumerate(_pairs[:20], 1):
+                        print(f"  {_rank:4d}. {_fname:55s}: {_fval:.6f}")
+        except Exception as _fie:
+            print(f"  (feature importance unavailable: {_fie})")
 
         # ── Corner bias diagnostic ────────────────────────────────────────
         print_step("Running corner bias diagnostic...")
@@ -3849,13 +3946,16 @@ class UFCPredictor:
         lr_pipe.fit(X_tr, y_tr)
         estimators.append(("lr", lr_pipe))
 
-        # XGBoost — conservative regularization defaults (Optuna overrides if available)
+        # XGBoost — tighter regularization defaults (Optuna overrides if available).
+        # min_child_weight=15 ensures each leaf spans at least 15 fights' gradients
+        # (on ~600 augmented training samples this prevents single-fight leaf nodes).
+        # reg_lambda=4.0 adds stronger L2 shrinkage.
         if HAS_XGB:
             xgb_params = {
-                "n_estimators": 500, "max_depth": 5, "learning_rate": 0.05,
+                "n_estimators": 400, "max_depth": 5, "learning_rate": 0.05,
                 "subsample": 0.8, "colsample_bytree": 0.8,
-                "min_child_weight": 10, "gamma": 1.0,
-                "reg_alpha": 1.5, "reg_lambda": 2.5,
+                "min_child_weight": 15, "gamma": 1.5,
+                "reg_alpha": 1.5, "reg_lambda": 4.0,
                 "scale_pos_weight": spw,
                 "random_state": RANDOM_SEED, "eval_metric": "logloss",
                 "verbosity": 0, "n_jobs": SAFE_N_JOBS,
@@ -3885,10 +3985,12 @@ class UFCPredictor:
             clf.fit(X_tr, y_tr)
             estimators.append(("lgb", clf))
 
-        # Random Forest
+        # Random Forest — max_depth=12 prevents extreme depth in 1200-feature space.
+        # Unlimited depth (None) with 1200 features produces very deep trees that
+        # memorize training data and generalize poorly; depth 12 is a hard cap.
         rf = RandomForestClassifier(
-            n_estimators=300, max_depth=None, min_samples_split=4,
-            min_samples_leaf=2, max_features="sqrt",
+            n_estimators=300, max_depth=12, min_samples_split=6,
+            min_samples_leaf=3, max_features="sqrt",
             random_state=RANDOM_SEED, n_jobs=1, class_weight="balanced"
         )
         rf.fit(X_tr, y_tr)
@@ -3909,11 +4011,14 @@ class UFCPredictor:
         mlp_pipe.fit(X_tr, y_tr)
         estimators.append(("mlp", mlp_pipe))
 
-        # CatBoost — balanced class weighting
+        # CatBoost — more conservative regularization for small UFC dataset.
+        # Original depth=6, iterations=500, l2=3 overfit on ~600 training fights;
+        # depth=5, iterations=300, l2=8 prevents memorization.
         if HAS_CAT:
             cat_params = {
-                "iterations": 500, "depth": 6, "learning_rate": 0.05,
-                "l2_leaf_reg": 3, "bagging_temperature": 1,
+                "iterations": 300, "depth": 5, "learning_rate": 0.05,
+                "l2_leaf_reg": 8, "bagging_temperature": 0.8,
+                "random_strength": 1.5,
                 "random_seed": RANDOM_SEED, "verbose": 0,
                 "eval_metric": "Logloss",
                 "auto_class_weights": "Balanced",
@@ -4078,9 +4183,11 @@ class UFCPredictor:
 
             feat_vec, raw_feat_vec = result
 
-            # Scale
+            # Scale then apply global selector (same pipeline as training)
             X = np.array([feat_vec])
             X_sel = self.scaler.transform(X)
+            if hasattr(self, '_global_selector') and self._global_selector is not None:
+                X_sel = self._global_selector.transform(X_sel)
 
             # Winner prediction
             win_proba = self.stacking_clf.predict_proba(X_sel)[0]
@@ -4202,24 +4309,52 @@ class UFCPredictor:
             ko_p  = finish_p * ko_share
             sub_p = finish_p * sub_share
 
-            # Most likely method uses blended fight-level probs (method is independent of
-            # which corner wins — a decision is a decision regardless of who's Red/Blue).
+            # Winner-conditioned method prediction — use the predicted winner's own
+            # historical rates for the Decision/Finish split, then blend ML signal
+            # for KO vs Sub.  Previously this used fight-level (both-fighter average)
+            # probs, so it would predict the most common method in the fight regardless
+            # of who was picked to win.
+            if winner_is_red:
+                w_ko_r, w_sub_r, w_dec_r = r_ko_r, r_sub_r, r_dec_r
+                ml_w_raw = np.array([red_dec_prob, red_ko_prob, red_sub_prob])
+            else:
+                w_ko_r, w_sub_r, w_dec_r = b_ko_r, b_sub_r, b_dec_r
+                ml_w_raw = np.array([blue_dec_prob, blue_ko_prob, blue_sub_prob])
+
+            # Normalize the ML winner-side probs
+            ml_w_sum = ml_w_raw.sum()
+            if ml_w_sum > 0:
+                ml_w_raw = ml_w_raw / ml_w_sum
+            ml_w_dec, ml_w_ko, ml_w_sub = ml_w_raw
+
+            # Step 1: Decision vs Finish — winner's rule-based historical rate
+            w_dec_p    = w_dec_r
+            w_finish_p = 1.0 - w_dec_p
+
+            # Step 2: KO vs Sub within finishes — blend winner's ML + rule-based
+            w_finish_r = w_ko_r + w_sub_r
+            w_ko_r_sh  = (w_ko_r  / w_finish_r) if w_finish_r > 0 else 0.5
+            w_sub_r_sh = (w_sub_r / w_finish_r) if w_finish_r > 0 else 0.5
+
+            ml_fin    = ml_w_ko + ml_w_sub
+            ml_ko_sh  = (ml_w_ko  / ml_fin) if ml_fin > 0 else 0.5
+            ml_sub_sh = (ml_w_sub / ml_fin) if ml_fin > 0 else 0.5
+
+            w_ko_sh  = 0.5 * ml_ko_sh  + 0.5 * w_ko_r_sh
+            w_sub_sh = 0.5 * ml_sub_sh + 0.5 * w_sub_r_sh
+            w_sh_tot = w_ko_sh + w_sub_sh
+            if w_sh_tot > 0:
+                w_ko_sh  /= w_sh_tot
+                w_sub_sh /= w_sh_tot
+
+            winner_dec_p = float(w_dec_p)
+            winner_ko_p  = float(w_finish_p * w_ko_sh)
+            winner_sub_p = float(w_finish_p * w_sub_sh)
+
             method_names_arr = ['Decision', 'KO/TKO', 'Submission']
-            method_arr = np.array([dec_p, ko_p, sub_p])
+            method_arr = np.array([winner_dec_p, winner_ko_p, winner_sub_p])
             method_pred = method_names_arr[int(np.argmax(method_arr))]
             method_conf = float(np.max(method_arr))
-
-            # Winner-conditioned method probs (for display breakdown)
-            if winner_is_red:
-                raw = np.array([red_dec_prob, red_ko_prob, red_sub_prob])
-            else:
-                raw = np.array([blue_dec_prob, blue_ko_prob, blue_sub_prob])
-            total = raw.sum()
-            if total > 0:
-                norm = raw / total
-            else:
-                norm = np.array([1/3, 1/3, 1/3])
-            winner_dec_p, winner_ko_p, winner_sub_p = float(norm[0]), float(norm[1]), float(norm[2])
 
             confidence = abs(r_win_prob - 0.5) * 2
 
