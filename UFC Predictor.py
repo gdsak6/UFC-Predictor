@@ -474,6 +474,88 @@ class PurgedTimeSeriesSplit:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# MANUAL OOF STACKING ENSEMBLE
+# ─────────────────────────────────────────────────────────────────────────────
+class _ManualStackingEnsemble:
+    """KFold-3 out-of-fold stacking that avoids StackingClassifier's NaN bug.
+
+    StackingClassifier's internal cross_val_predict produces NaN meta-features
+    for some base models (rf, mlp, cat), causing their LR meta-learner
+    coefficients to be NaN and making those models useless. This class does
+    the same OOF stacking explicitly, catching NaN/exceptions per model per
+    fold so every base model contributes valid meta-features to the LR meta-
+    learner. Base models are passed already-fitted; clones are used for OOF
+    folds, and the originals are used for test-time inference.
+    """
+
+    def __init__(self, estimators, meta_C=0.05, n_splits=3, random_state=42):
+        # estimators: list of (name, already-fitted estimator)
+        self.estimators  = estimators
+        self.meta_C      = meta_C
+        self.n_splits    = n_splits
+        self.random_state = random_state
+        self.classes_         = None
+        self.final_estimator_ = None
+
+    def fit(self, X, y):
+        from sklearn.base import clone as _clone
+        y = np.asarray(y)
+        self.classes_ = np.unique(y)
+        nc = len(self.classes_)          # 2 for binary
+        n  = X.shape[0]
+        nm = len(self.estimators)
+
+        # OOF meta-feature matrix: n_samples × (n_models × n_classes)
+        meta_X_oof = np.full((n, nm * nc), 1.0 / nc)
+
+        kf = KFold(n_splits=self.n_splits, shuffle=False)
+        for tr_idx, va_idx in kf.split(X):
+            X_tr_f, X_va_f = X[tr_idx], X[va_idx]
+            y_tr_f = y[tr_idx]
+            for ei, (name, est) in enumerate(self.estimators):
+                col = ei * nc
+                try:
+                    fold_est = _clone(est)
+                    fold_est.fit(X_tr_f, y_tr_f)
+                    proba = fold_est.predict_proba(X_va_f)
+                    if proba.shape[1] != nc or np.any(np.isnan(proba)):
+                        raise ValueError("bad proba shape or NaN")
+                    meta_X_oof[va_idx, col:col + nc] = proba
+                except Exception:
+                    # Fall back to uniform for this model/fold — still contributes
+                    meta_X_oof[va_idx, col:col + nc] = 1.0 / nc
+
+        # Train LR meta-learner on OOF meta-features
+        self.final_estimator_ = LogisticRegression(
+            C=self.meta_C, max_iter=1000,
+            random_state=self.random_state, solver="lbfgs"
+        )
+        self.final_estimator_.fit(meta_X_oof, y)
+        return self
+
+    def _meta_features(self, X):
+        nc = len(self.classes_)
+        nm = len(self.estimators)
+        meta_X = np.full((X.shape[0], nm * nc), 1.0 / nc)
+        for ei, (name, est) in enumerate(self.estimators):
+            col = ei * nc
+            try:
+                proba = est.predict_proba(X)
+                if proba.shape[1] != nc or np.any(np.isnan(proba)):
+                    raise ValueError("bad proba")
+                meta_X[:, col:col + nc] = proba
+            except Exception:
+                meta_X[:, col:col + nc] = 1.0 / nc
+        return meta_X
+
+    def predict(self, X):
+        return self.final_estimator_.predict(self._meta_features(X))
+
+    def predict_proba(self, X):
+        return self.final_estimator_.predict_proba(self._meta_features(X))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # UFC PREDICTOR
 # ─────────────────────────────────────────────────────────────────────────────
 class UFCPredictor:
@@ -1453,31 +1535,43 @@ class UFCPredictor:
                                      "TD": td/cnt, "Sub": sub/cnt, "Finish": finish/cnt}
         fe.fit_clusters(fighter_style)
 
-        # Populate style performance by replaying historical outcomes in order
-        # This gives get_style_matchup_features() real win-rate data per cluster matchup
-        for _, row in df.sort_values("event_date", na_position="first").iterrows():
+        # Populate style-cluster features using pre-fight chronological snapshots.
+        # Single sorted pass: snapshot win-rates BEFORE updating with the outcome
+        # so each row only sees data from fights that already happened.
+        # The previous two-pass approach (replay all → assign features using final
+        # cumulative rates) leaked future outcomes into every row's features.
+        _style_snap = {}  # df index → (rc, bc, r_winrate, b_winrate, edge)
+        for idx, row in df.sort_values("event_date", na_position="first").iterrows():
             r = str(row.get("r_fighter", ""))
             b = str(row.get("b_fighter", ""))
             winner = str(row.get("winner", ""))
             rc = fe.get_fighter_cluster(r)
             bc = fe.get_fighter_cluster(b)
             if rc >= 0 and bc >= 0:
+                # Snapshot PRE-fight win rates before this outcome is recorded
+                mf = fe.get_style_matchup_features(rc, bc)
+                _style_snap[idx] = (
+                    rc, bc,
+                    mf["r_style_win_vs_opp_cluster"],
+                    mf["b_style_win_vs_opp_cluster"],
+                    mf["style_matchup_edge"],
+                )
+                # NOW update with this fight's outcome
                 fe.update_style_performance(rc, bc, winner == "Red")
                 fe.update_style_performance(bc, rc, winner == "Blue")
+            else:
+                _style_snap[idx] = (rc, bc, 0.5, 0.5, 0.0)
 
         r_cluster, b_cluster, style_edge = [], [], []
         r_style_win, b_style_win = [], []
-        for _, row in df.iterrows():
-            r = str(row.get("r_fighter", ""))
-            b = str(row.get("b_fighter", ""))
-            rc = fe.get_fighter_cluster(r)
-            bc = fe.get_fighter_cluster(b)
-            mf = fe.get_style_matchup_features(rc, bc)
+        for idx, row in df.iterrows():
+            snap = _style_snap.get(idx, (-1, -1, 0.5, 0.5, 0.0))
+            rc, bc, rw, bw, edge = snap
             r_cluster.append(rc)
             b_cluster.append(bc)
-            style_edge.append(mf["style_matchup_edge"])
-            r_style_win.append(mf["r_style_win_vs_opp_cluster"])
-            b_style_win.append(mf["b_style_win_vs_opp_cluster"])
+            r_style_win.append(rw)
+            b_style_win.append(bw)
+            style_edge.append(edge)
         df["r_style_cluster"] = r_cluster
         df["b_style_cluster"] = b_cluster
         df["style_matchup_edge"] = style_edge
@@ -2625,40 +2719,23 @@ class UFCPredictor:
         estimators = self._build_estimators(X_tr_sel, y_tr)
         print_metric("Base estimators time:", f"{time.time()-t0_estimators:.1f}s")
 
-        # ── StackingClassifier with TimeSeriesSplit(3) CV ──────────────────
-        # The meta-learner (LogisticRegression) is trained on out-of-fold
-        # predictions from 3 time-ordered CV splits of the training set — NOT
-        # on the single 10% validation window that caused VotingClassifier's
-        # weight optimizer to assign 77%+ to XGB.  Cross-validated meta-learning
-        # is more robust to a specific period's characteristics.
-        # LR is inherently calibrated (sigmoid output), so no additional
-        # CalibratedClassifierCV wrapper is needed.
-        print_step("Building stacking ensemble (TimeSeriesSplit-3 CV meta-learning)...")
+        # ── Manual OOF stacking with KFold-3 ───────────────────────────────
+        # Replaces StackingClassifier to fix the NaN stacking bug: sklearn's
+        # StackingClassifier uses cross_val_predict internally, which produces
+        # NaN meta-features for rf/mlp/cat in our setup, leaving those models
+        # with NaN LR coefficients and making them useless.  _ManualStackingEnsemble
+        # does the same KFold-3 OOF stacking explicitly, catching NaN/exceptions
+        # per model per fold so all 6 base models contribute valid meta-features.
+        print_step("Building stacking ensemble (manual KFold-3 OOF meta-learning)...")
         t0_stack = time.time()
-        from sklearn.base import clone as _sklearn_clone
-        from sklearn.ensemble import StackingClassifier as _StackingCLF
-        # Clone unfitted copies — StackingClassifier requires unfitted estimators
-        # for its internal cross-validated meta-feature generation.
-        _unfitted = [(n, _sklearn_clone(e)) for n, e in estimators]
-        _stk = _StackingCLF(
-            estimators=_unfitted,
-            final_estimator=LogisticRegression(
-                C=0.05, max_iter=1000, random_state=RANDOM_SEED, solver="lbfgs"
-            ),
-            # KFold(shuffle=False) is required here: StackingClassifier pipes CV
-            # through cross_val_predict, which demands every sample appear in
-            # exactly one test fold (a partition).  TimeSeriesSplit fails that
-            # because its initial training window is never a test set, leaving
-            # those samples without meta-features.  KFold with shuffle=False
-            # splits into 3 consecutive chronological blocks — the partition
-            # requirement is met and temporal order within each fold is kept.
-            cv=KFold(n_splits=3, shuffle=False),
-            stack_method="predict_proba",
-            n_jobs=1,
-            passthrough=False,
+        _stk = _ManualStackingEnsemble(
+            estimators=estimators,   # already fitted by _build_estimators
+            meta_C=0.05,
+            n_splits=3,
+            random_state=RANDOM_SEED,
         )
         _stk.fit(X_tr_sel, y_tr)
-        # Store the full-training-fit stacking model for feature importance display
+        # Store for downstream use
         self._base_ensemble = _stk
         self.stacking_clf   = _stk
 
@@ -2668,12 +2745,11 @@ class UFCPredictor:
             if hasattr(_meta, "coef_"):
                 _coefs     = _meta.coef_[0]
                 _est_names = [n for n, _ in estimators]
+                nc         = len(_stk.classes_)
                 print_step("Meta-learner model contributions "
                            "(LR coef on class-1 probability column):")
-                # predict_proba gives 2 cols per model (class-0, class-1);
-                # the class-1 column (odd index) is what drives Red-win prediction.
                 for _ei, _ename in enumerate(_est_names):
-                    _ci = _ei * 2 + 1
+                    _ci = _ei * nc + 1   # class-1 column
                     _c  = float(_coefs[_ci]) if _ci < len(_coefs) else float("nan")
                     print(f"    {_ename:<6s}  coef={_c:+.4f}")
         except Exception:
