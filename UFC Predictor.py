@@ -36,7 +36,7 @@ from sklearn.decomposition import TruncatedSVD
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.cluster import KMeans
 from sklearn.metrics import accuracy_score, log_loss
-from sklearn.model_selection import cross_val_score, TimeSeriesSplit, KFold
+from sklearn.model_selection import cross_val_score, TimeSeriesSplit
 import openpyxl
 from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
@@ -477,7 +477,7 @@ class PurgedTimeSeriesSplit:
 # MANUAL OOF STACKING ENSEMBLE
 # ─────────────────────────────────────────────────────────────────────────────
 class _ManualStackingEnsemble:
-    """KFold-3 out-of-fold stacking that avoids StackingClassifier's NaN bug.
+    """TimeSeriesSplit-5 out-of-fold stacking that avoids StackingClassifier's NaN bug.
 
     StackingClassifier's internal cross_val_predict produces NaN meta-features
     for some base models (rf, mlp, cat), causing their LR meta-learner
@@ -508,7 +508,7 @@ class _ManualStackingEnsemble:
         # OOF meta-feature matrix: n_samples × (n_models × n_classes)
         meta_X_oof = np.full((n, nm * nc), 1.0 / nc)
 
-        kf = KFold(n_splits=self.n_splits, shuffle=False)
+        kf = TimeSeriesSplit(n_splits=self.n_splits)
         for tr_idx, va_idx in kf.split(X):
             X_tr_f, X_va_f = X[tr_idx], X[va_idx]
             y_tr_f = y[tr_idx]
@@ -2674,7 +2674,7 @@ class UFCPredictor:
         if HAS_OPTUNA and HAS_LGB:
             print_step("Running Optuna hyperparameter search for LightGBM (15 trials)...")
             lgb_optuna_start = time.time()
-            LGB_TRIALS = 15  # TEMP: speed test (restore to 15)
+            LGB_TRIALS = 15
 
             def lgb_optuna_objective(trial):
                 params = {
@@ -2792,19 +2792,19 @@ class UFCPredictor:
         estimators = self._build_estimators(X_tr_sel, y_tr)
         print_metric("Base estimators time:", f"{time.time()-t0_estimators:.1f}s")
 
-        # ── Manual OOF stacking with KFold-3 ───────────────────────────────
+        # ── Manual OOF stacking with TimeSeriesSplit-5 ─────────────────────
         # Replaces StackingClassifier to fix the NaN stacking bug: sklearn's
         # StackingClassifier uses cross_val_predict internally, which produces
         # NaN meta-features for rf/mlp/cat in our setup, leaving those models
-        # with NaN LR coefficients and making them useless.  _ManualStackingEnsemble
-        # does the same KFold-3 OOF stacking explicitly, catching NaN/exceptions
-        # per model per fold so all 6 base models contribute valid meta-features.
-        print_step("Building stacking ensemble (manual KFold-3 OOF meta-learning)...")
+        # with NaN coefficients and making them useless.  _ManualStackingEnsemble
+        # does the same OOF stacking explicitly with TimeSeriesSplit (respects
+        # temporal ordering), catching NaN/exceptions per model per fold.
+        print_step("Building stacking ensemble (manual TimeSeriesSplit-5 OOF meta-learning)...")
         t0_stack = time.time()
         _stk = _ManualStackingEnsemble(
             estimators=estimators,   # already fitted by _build_estimators
             meta_C=0.05,
-            n_splits=3,
+            n_splits=5,
             random_state=RANDOM_SEED,
         )
         _stk.fit(X_tr_sel, y_tr)
