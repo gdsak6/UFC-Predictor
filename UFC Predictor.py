@@ -525,11 +525,27 @@ class _ManualStackingEnsemble:
                     # Fall back to uniform for this model/fold — still contributes
                     meta_X_oof[va_idx, col:col + nc] = 1.0 / nc
 
-        # Train LR meta-learner on OOF meta-features
-        self.final_estimator_ = LogisticRegression(
-            C=self.meta_C, max_iter=1000,
-            random_state=self.random_state, solver="lbfgs"
-        )
+        # Train XGB meta-learner on OOF meta-features (light regularization)
+        if HAS_XGB:
+            self.final_estimator_ = xgb.XGBClassifier(
+                n_estimators=200,
+                max_depth=2,
+                learning_rate=0.05,
+                reg_alpha=0.1,
+                reg_lambda=1.0,
+                min_child_weight=3,
+                subsample=0.8,
+                colsample_bytree=1.0,
+                use_label_encoder=False,
+                eval_metric="logloss",
+                random_state=self.random_state,
+                verbosity=0,
+            )
+        else:
+            self.final_estimator_ = LogisticRegression(
+                C=self.meta_C, max_iter=1000,
+                random_state=self.random_state, solver="lbfgs"
+            )
         self.final_estimator_.fit(meta_X_oof, y)
         return self
 
@@ -2796,17 +2812,23 @@ class UFCPredictor:
         self._base_ensemble = _stk
         self.stacking_clf   = _stk
 
-        # Show meta-learner coefficients (model contributions)
+        # Show meta-learner feature importances (model contributions)
         try:
             _meta = _stk.final_estimator_
-            if hasattr(_meta, "coef_"):
-                _coefs     = _meta.coef_[0]
-                _est_names = [n for n, _ in estimators]
-                nc         = len(_stk.classes_)
-                print_step("Meta-learner model contributions "
-                           "(LR coef on class-1 probability column):")
+            _est_names = [n for n, _ in estimators]
+            nc = len(_stk.classes_)
+            if hasattr(_meta, "feature_importances_"):
+                _imp = _meta.feature_importances_
+                print_step("Meta-learner model contributions (XGB feature importance, class-1 col):")
                 for _ei, _ename in enumerate(_est_names):
                     _ci = _ei * nc + 1   # class-1 column
+                    _v  = float(_imp[_ci]) if _ci < len(_imp) else float("nan")
+                    print(f"    {_ename:<6s}  importance={_v:.4f}")
+            elif hasattr(_meta, "coef_"):
+                _coefs = _meta.coef_[0]
+                print_step("Meta-learner model contributions (LR coef on class-1 probability column):")
+                for _ei, _ename in enumerate(_est_names):
+                    _ci = _ei * nc + 1
                     _c  = float(_coefs[_ci]) if _ci < len(_coefs) else float("nan")
                     print(f"    {_ename:<6s}  coef={_c:+.4f}")
         except Exception:
