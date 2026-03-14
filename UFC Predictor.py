@@ -36,7 +36,7 @@ from sklearn.decomposition import TruncatedSVD
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.cluster import KMeans
 from sklearn.metrics import accuracy_score, log_loss
-from sklearn.model_selection import cross_val_score, TimeSeriesSplit
+from sklearn.model_selection import cross_val_score, TimeSeriesSplit, KFold
 import openpyxl
 from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
@@ -229,10 +229,6 @@ class FeatureEngineer:
             elif finish_round == 3:
                 k *= 1.2
             # else round 4+ -> no extra modifier (×1.0)
-        # Split/majority decisions are less informative — close fights carry a
-        # smaller rating update in both directions (winner and loser).
-        if ("Split" in method or "Majority" in method):
-            k *= 0.8
         # Streak multiplier: 3+ fight win streak
         if winner_streak >= 3 and result == "win":
             k *= 1.1
@@ -481,16 +477,15 @@ class PurgedTimeSeriesSplit:
 # MANUAL OOF STACKING ENSEMBLE
 # ─────────────────────────────────────────────────────────────────────────────
 class _ManualStackingEnsemble:
-    """TimeSeriesSplit OOF stacking that avoids StackingClassifier's NaN bug.
+    """KFold-3 out-of-fold stacking that avoids StackingClassifier's NaN bug.
 
     StackingClassifier's internal cross_val_predict produces NaN meta-features
     for some base models (rf, mlp, cat), causing their LR meta-learner
     coefficients to be NaN and making those models useless. This class does
-    the same OOF stacking explicitly using TimeSeriesSplit (not KFold) to
-    preserve temporal ordering, catching NaN/exceptions per model per fold so
-    every base model contributes valid meta-features to the meta-learner.
-    Base models are passed already-fitted; clones are used for OOF folds,
-    and the originals are used for test-time inference.
+    the same OOF stacking explicitly, catching NaN/exceptions per model per
+    fold so every base model contributes valid meta-features to the LR meta-
+    learner. Base models are passed already-fitted; clones are used for OOF
+    folds, and the originals are used for test-time inference.
     """
 
     def __init__(self, estimators, meta_C=0.05, n_splits=3, random_state=42):
@@ -502,7 +497,7 @@ class _ManualStackingEnsemble:
         self.classes_         = None
         self.final_estimator_ = None
 
-    def fit(self, X, y, sample_weight=None):
+    def fit(self, X, y):
         from sklearn.base import clone as _clone
         y = np.asarray(y)
         self.classes_ = np.unique(y)
@@ -510,16 +505,10 @@ class _ManualStackingEnsemble:
         n  = X.shape[0]
         nm = len(self.estimators)
 
-        sw = np.asarray(sample_weight) if sample_weight is not None else None
-
         # OOF meta-feature matrix: n_samples × (n_models × n_classes)
         meta_X_oof = np.full((n, nm * nc), 1.0 / nc)
 
-        # TimeSeriesSplit preserves temporal ordering: later folds always train
-        # on older fights and validate on newer ones, preventing future leakage.
-        # KFold(shuffle=False) would let fold-1 train on folds 2+3 (future fights)
-        # to predict fold-1 (older fights), leaking outcome information backwards.
-        kf = TimeSeriesSplit(n_splits=self.n_splits)
+        kf = KFold(n_splits=self.n_splits, shuffle=False)
         for tr_idx, va_idx in kf.split(X):
             X_tr_f, X_va_f = X[tr_idx], X[va_idx]
             y_tr_f = y[tr_idx]
@@ -527,11 +516,7 @@ class _ManualStackingEnsemble:
                 col = ei * nc
                 try:
                     fold_est = _clone(est)
-                    sw_fold = sw[tr_idx] if sw is not None else None
-                    try:
-                        fold_est.fit(X_tr_f, y_tr_f, sample_weight=sw_fold)
-                    except TypeError:
-                        fold_est.fit(X_tr_f, y_tr_f)
+                    fold_est.fit(X_tr_f, y_tr_f)
                     proba = fold_est.predict_proba(X_va_f)
                     if proba.shape[1] != nc or np.any(np.isnan(proba)):
                         raise ValueError("bad proba shape or NaN")
@@ -540,27 +525,12 @@ class _ManualStackingEnsemble:
                     # Fall back to uniform for this model/fold — still contributes
                     meta_X_oof[va_idx, col:col + nc] = 1.0 / nc
 
-        # XGBoost meta-learner: shallow tree captures non-linear base-model
-        # interactions (e.g. "trust LGB less when RF disagrees strongly").
-        # Strong regularisation prevents overfitting on the small OOF set.
-        try:
-            import xgboost as _xgb_meta
-            self.final_estimator_ = _xgb_meta.XGBClassifier(
-                n_estimators=200, max_depth=2, learning_rate=0.05,
-                subsample=0.8, colsample_bytree=0.8,
-                reg_alpha=5.0, reg_lambda=10.0, min_child_weight=10,
-                eval_metric='logloss', random_state=self.random_state,
-                verbosity=0, n_jobs=1,
-            )
-        except ImportError:
-            self.final_estimator_ = LogisticRegression(
-                C=self.meta_C, max_iter=1000,
-                random_state=self.random_state, solver="lbfgs"
-            )
-        self.final_estimator_.fit(meta_X_oof, y, sample_weight=sw)
-        # Store OOF predictions for post-fit isotonic calibration
-        self.oof_meta_X_ = meta_X_oof.copy()
-        self.oof_y_      = y.copy()
+        # Train LR meta-learner on OOF meta-features
+        self.final_estimator_ = LogisticRegression(
+            C=self.meta_C, max_iter=1000,
+            random_state=self.random_state, solver="lbfgs"
+        )
+        self.final_estimator_.fit(meta_X_oof, y)
         return self
 
     def _meta_features(self, X):
@@ -578,16 +548,11 @@ class _ManualStackingEnsemble:
                 meta_X[:, col:col + nc] = 1.0 / nc
         return meta_X
 
-    def predict_proba(self, X):
-        raw = self.final_estimator_.predict_proba(self._meta_features(X))
-        if hasattr(self, '_isotonic_calibrator'):
-            p1 = np.clip(self._isotonic_calibrator.predict(raw[:, 1]), 1e-7, 1 - 1e-7)
-            return np.column_stack([1.0 - p1, p1])
-        return raw
-
     def predict(self, X):
-        proba = self.predict_proba(X)
-        return self.classes_[np.argmax(proba, axis=1)]
+        return self.final_estimator_.predict(self._meta_features(X))
+
+    def predict_proba(self, X):
+        return self.final_estimator_.predict_proba(self._meta_features(X))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -755,7 +720,6 @@ class UFCPredictor:
 
         fighter_stats = defaultdict(lambda: copy.deepcopy(stats_to_track))
         fighter_fights_count = defaultdict(int)
-        h2h_history = defaultdict(list)   # frozenset({r,b}) -> list of winner fighter names
 
         leakage_cols_r = [c for c in self.df.columns if c.startswith("r_")]
         leakage_cols_b = [c for c in self.df.columns if c.startswith("b_")]
@@ -844,35 +808,9 @@ class UFCPredictor:
             "r_pre_slpm_std_l10",         "b_pre_slpm_std_l10",
             "r_pre_damage_ratio_std_l10", "b_pre_damage_ratio_std_l10",
             "r_pre_tactical_evolution",   "b_pre_tactical_evolution",
-            # Exponentially-weighted rolling stats (Item 1)
-            "r_ewm_wins",    "b_ewm_wins",
-            "r_ewm_sig_str", "b_ewm_sig_str",
-            "r_ewm_td",      "b_ewm_td",
-            "r_ewm_kd",      "b_ewm_kd",
-            "r_ewm_sub_att", "b_ewm_sub_att",
-            # Loss method breakdown (Item 5)
-            "r_pre_ko_losses",  "b_pre_ko_losses",
-            "r_pre_sub_losses", "b_pre_sub_losses",
-            "r_pre_dec_losses", "b_pre_dec_losses",
-            # Rematch features
-            "is_rematch", "n_prior_fights", "prior_winner_is_red",
-            # Opponent-quality-adjusted win rate
-            "r_adj_win_rate", "b_adj_win_rate",
         ]
         for col in new_cols:
             self.df[col] = 0.0
-
-        # Exponentially-decayed weighted average over history entries.
-        # Most recent = weight 1.0; each fight further back decays by e^(-0.5).
-        # Positional (not date-based) since _history entries don't store dates.
-        def _ewm_hist(entries, key):
-            if not entries:
-                return 0.0
-            vals = [h.get(key, 0) for h in entries]
-            n = len(vals)
-            w = np.array([np.exp(-0.5 * (n - 1 - i)) for i in range(n)])
-            w /= w.sum()
-            return float(np.dot(w, vals))
 
         for idx, row in self.df.iterrows():
             r = str(row.get("r_fighter", "")).strip()
@@ -909,14 +847,6 @@ class UFCPredictor:
             self.df.at[idx, "b_pre_ko_wins"] = bs["ko_wins"]
             self.df.at[idx, "b_pre_sub_wins"] = bs["sub_wins"]
             self.df.at[idx, "b_pre_dec_wins"] = bs["dec_wins"]
-            # Loss method breakdown — KO losses signal chin deterioration,
-            # sub losses signal grappling vulnerability
-            self.df.at[idx, "r_pre_ko_losses"]  = rs["ko_losses"]
-            self.df.at[idx, "r_pre_sub_losses"] = rs["sub_losses"]
-            self.df.at[idx, "r_pre_dec_losses"] = rs["dec_losses"]
-            self.df.at[idx, "b_pre_ko_losses"]  = bs["ko_losses"]
-            self.df.at[idx, "b_pre_sub_losses"] = bs["sub_losses"]
-            self.df.at[idx, "b_pre_dec_losses"] = bs["dec_losses"]
             self.df.at[idx, "r_pre_total_fights"] = rs["total_fights"]
             self.df.at[idx, "b_pre_total_fights"] = bs["total_fights"]
             self.df.at[idx, "r_pre_finish_rate"] = rs["finish_rate"]
@@ -984,16 +914,6 @@ class UFCPredictor:
             self.df.at[idx, "b_rolling5_td"] = np.mean([h["td"] for h in hist_b5]) if hist_b5 else 0.0
             self.df.at[idx, "r_rolling5_kd"] = np.mean([h["kd"] for h in hist_r5]) if hist_r5 else 0.0
             self.df.at[idx, "b_rolling5_kd"] = np.mean([h["kd"] for h in hist_b5]) if hist_b5 else 0.0
-
-            # Exponentially-weighted rolling stats (last 5 fights, positional decay)
-            # Gives more weight to recent fights than simple unweighted means.
-            for _corner, _hist in (("r", rs["_history"]), ("b", bs["_history"])):
-                _h5 = _hist[-5:]
-                self.df.at[idx, f"{_corner}_ewm_wins"]    = _ewm_hist(_h5, "won")
-                self.df.at[idx, f"{_corner}_ewm_sig_str"] = _ewm_hist(_h5, "sig_str")
-                self.df.at[idx, f"{_corner}_ewm_td"]      = _ewm_hist(_h5, "td")
-                self.df.at[idx, f"{_corner}_ewm_kd"]      = _ewm_hist(_h5, "kd")
-                self.df.at[idx, f"{_corner}_ewm_sub_att"] = _ewm_hist(_h5, "sub_att")
 
             # Glicko-2 pre-fight snapshot (BEFORE update — prevents data leakage in Tier 4)
             r_glicko_snap = self.feature_engineer.glicko2_get(r)
@@ -1118,27 +1038,6 @@ class UFCPredictor:
                 _dp_allm = float(np.mean(_dp_all))  if _dp_all else 0.5
                 self.df.at[idx, f"{corner}_pre_tactical_evolution"] = _dp_l5m - _dp_allm
 
-            # ── Rematch feature snapshot ──────────────────────────────────
-            _h2h_pair = frozenset([r, b])
-            _prior_h2h = h2h_history[_h2h_pair]
-            _n_prior = len(_prior_h2h)
-            _prior_winner_is_red = 0.0
-            if _n_prior > 0 and _prior_h2h[-1] is not None:
-                _prior_winner_is_red = 1.0 if _prior_h2h[-1] == r else -1.0
-            self.df.at[idx, "is_rematch"]           = float(_n_prior > 0)
-            self.df.at[idx, "n_prior_fights"]        = float(_n_prior)
-            self.df.at[idx, "prior_winner_is_red"]   = _prior_winner_is_red
-
-            # ── Opponent-quality-adjusted win rate snapshot ───────────────
-            def _adj_win_rate(history):
-                if not history:
-                    return 0.5
-                weighted_wins  = sum(h.get("won", 0) * h.get("opp_elo", 1500.0) for h in history)
-                total_weight   = sum(h.get("opp_elo", 1500.0) for h in history)
-                return weighted_wins / total_weight if total_weight > 0 else 0.5
-            self.df.at[idx, "r_adj_win_rate"] = _adj_win_rate(rs["_history"])
-            self.df.at[idx, "b_adj_win_rate"] = _adj_win_rate(bs["_history"])
-
             # ── ELO pre-fight ─────────────────────────────────────────────
             r_elo_pre = self.feature_engineer.elo_get(r)
             b_elo_pre = self.feature_engineer.elo_get(b)
@@ -1250,12 +1149,6 @@ class UFCPredictor:
             b_hist = update_fight_stats(bs, "b", row)
             rs["_history"].append(r_hist)
             bs["_history"].append(b_hist)
-            # Patch opp_elo into the just-appended history entries
-            rs["_history"][-1]["opp_elo"] = b_elo_pre
-            bs["_history"][-1]["opp_elo"] = r_elo_pre
-            # Record this fight's outcome in h2h tracker
-            _h2h_winner = r if r_won else (b if b_won else None)
-            h2h_history[_h2h_pair].append(_h2h_winner)
             fighter_fights_count[r] += 1
             fighter_fights_count[b] += 1
 
@@ -1615,19 +1508,12 @@ class UFCPredictor:
 
         # ── TIER 7: Style cluster features ────────────────────────────────
         self._log("Tier 7: Style cluster features...")
-        # Restrict KMeans cluster fitting to the training portion of the data
-        # (chronological first 90%) so test-set fighters don't influence cluster
-        # centroids. Test-set fighters who never appeared in training will still
-        # receive a cluster assignment via the fitted KMeans model; they just
-        # don't shift the centroids during fitting.
-        _n_train_proxy = int(len(df) * 0.9)
-        _train_idx_set = set(
-            df.sort_values("event_date", na_position="first").index[:_n_train_proxy]
-        )
         fighter_style = {}
         for f in self.all_fighters:
-            r_rows = df[(df["r_fighter"] == f) & (df.index.isin(_train_idx_set))]
-            b_rows = df[(df["b_fighter"] == f) & (df.index.isin(_train_idx_set))]
+            # Use final ELO (proxy for quality)
+            elo = fe.elo_get(f)
+            r_rows = df[df["r_fighter"] == f]
+            b_rows = df[df["b_fighter"] == f]
             slpm = 0.0; sapm = 0.0; td = 0.0; sub = 0.0; finish = 0.0
             cnt = 0
             for _, row in r_rows.iterrows():
@@ -2491,84 +2377,6 @@ class UFCPredictor:
         _b_tact = df.get("b_pre_tactical_evolution", pd.Series(0.0, index=df.index)).fillna(0.0)
         df["tactical_evolution_score_diff"] = _r_tact - _b_tact
 
-        # ── TIER 29: New signal features ─────────────────────────────────────
-        self._log("Tier 29: New signal features...")
-
-        # -- Item 5: Loss method breakdown (chin & submission vulnerability) ---
-        for _px in ("r", "b"):
-            _ko_l  = df.get(f"{_px}_pre_ko_losses",  pd.Series(0.0, index=df.index)).fillna(0.0)
-            _sub_l = df.get(f"{_px}_pre_sub_losses", pd.Series(0.0, index=df.index)).fillna(0.0)
-            _tot_l = df.get(f"{_px}_pre_losses",     pd.Series(1.0, index=df.index)).fillna(1.0).clip(lower=1)
-            df[f"{_px}_ko_loss_rate"]  = _ko_l  / _tot_l
-            df[f"{_px}_sub_loss_rate"] = _sub_l / _tot_l
-        df["chin_vulnerability_diff"] = df["r_ko_loss_rate"]  - df["b_ko_loss_rate"]
-        df["sub_vulnerability_diff"]  = df["r_sub_loss_rate"] - df["b_sub_loss_rate"]
-
-        # -- Item 6: Strike accuracy differential --------------------------------
-        _r_sa = df.get("r_pre_sig_str_acc", pd.Series(0.43, index=df.index)).fillna(0.43)
-        _b_sa = df.get("b_pre_sig_str_acc", pd.Series(0.43, index=df.index)).fillna(0.43)
-        df["diff_sig_str_acc"] = _r_sa - _b_sa
-        # Volume × accuracy: distinguish high-volume/low-acc from low-volume/high-acc
-        _r_slpm_t29 = df.get("r_pre_SLpM", pd.Series(3.0, index=df.index)).fillna(3.0)
-        _b_slpm_t29 = df.get("b_pre_SLpM", pd.Series(3.0, index=df.index)).fillna(3.0)
-        df["r_effective_striking"] = _r_slpm_t29 * _r_sa
-        df["b_effective_striking"] = _b_slpm_t29 * _b_sa
-        df["effective_striking_diff"] = df["r_effective_striking"] - df["b_effective_striking"]
-
-        # -- Item 7: Physical matchup interaction features -----------------------
-        _reach_diff_t29  = df.get("diff_reach",     pd.Series(0.0, index=df.index)).fillna(0.0)
-        _height_diff_t29 = df.get("diff_height",    pd.Series(0.0, index=df.index)).fillna(0.0)
-        _style_edge_t29  = df.get("style_matchup_edge", pd.Series(0.0, index=df.index)).fillna(0.0)
-        _r_fin_t29       = df.get("r_pre_finish_rate", pd.Series(0.4, index=df.index)).fillna(0.4)
-        _b_fin_t29       = df.get("b_pre_finish_rate", pd.Series(0.4, index=df.index)).fillna(0.4)
-        # Reach advantage amplified by strike accuracy edge
-        df["reach_x_str_acc_diff"]  = _reach_diff_t29 * df["diff_sig_str_acc"]
-        # Reach advantage interacting with style matchup edge
-        df["reach_x_style_edge"]    = _reach_diff_t29 * _style_edge_t29
-        # Height advantage interacting with finishing tendency
-        df["height_x_finish_diff"]  = _height_diff_t29 * (_r_fin_t29 - _b_fin_t29)
-
-        # -- Item 3: Layoff × age interaction ------------------------------------
-        _r_days_t29 = df.get("r_days_since_last", pd.Series(180.0, index=df.index)).fillna(180.0)
-        _b_days_t29 = df.get("b_days_since_last", pd.Series(180.0, index=df.index)).fillna(180.0)
-        _r_age_t29  = df.get("r_current_age",     pd.Series(28.0,  index=df.index)).fillna(28.0)
-        _b_age_t29  = df.get("b_current_age",     pd.Series(28.0,  index=df.index)).fillna(28.0)
-        # Older fighters coming back from longer layoffs suffer more ring rust
-        df["r_layoff_age_penalty"] = (_r_days_t29 / 365.0) * np.clip(_r_age_t29 - 28.0, 0.0, None)
-        df["b_layoff_age_penalty"] = (_b_days_t29 / 365.0) * np.clip(_b_age_t29 - 28.0, 0.0, None)
-        df["layoff_age_penalty_diff"] = df["r_layoff_age_penalty"] - df["b_layoff_age_penalty"]
-
-        # -- Item 4: Weight-class-specific age curve modeling -------------------
-        # Approximate peak competitive age by weight class (lighter = peaks earlier)
-        _WC_PEAK_AGE = {
-            "Heavyweight": 31, "Light Heavyweight": 30,
-            "Middleweight": 30, "Welterweight": 29,
-            "Lightweight": 28, "Featherweight": 27,
-            "Bantamweight": 27, "Flyweight": 26,
-            "Women's Featherweight": 28, "Women's Bantamweight": 27,
-            "Women's Flyweight": 26, "Women's Strawweight": 25,
-        }
-        _wc_col = df.get("weight_class", pd.Series("Lightweight", index=df.index)).fillna("Lightweight")
-        _wc_peak = _wc_col.map(_WC_PEAK_AGE).fillna(29.0)
-        df["r_age_vs_wc_peak"] = _r_age_t29 - _wc_peak
-        df["b_age_vs_wc_peak"] = _b_age_t29 - _wc_peak
-        df["age_vs_peak_diff"] = df["r_age_vs_wc_peak"] - df["b_age_vs_wc_peak"]
-        # Past-prime penalty: only penalise fighters past their weight-class peak
-        df["r_past_prime"] = np.clip(df["r_age_vs_wc_peak"], 0.0, None)
-        df["b_past_prime"] = np.clip(df["b_age_vs_wc_peak"], 0.0, None)
-        df["past_prime_diff"] = df["r_past_prime"] - df["b_past_prime"]
-
-        # r_ewm_* / b_ewm_* pairs are handled by the D+I antisymmetric
-        # decomposition automatically — no manual diff columns needed here.
-
-        # -- Rematch prior edge --------------------------------------------------
-        df["rematch_prior_edge"] = df.get("prior_winner_is_red", pd.Series(0.0, index=df.index)).fillna(0.0) * \
-                                   df.get("is_rematch", pd.Series(0.0, index=df.index)).fillna(0.0)
-
-        # -- Opponent-quality-adjusted win rate differential --------------------
-        if "r_adj_win_rate" in df.columns and "b_adj_win_rate" in df.columns:
-            df["adj_win_rate_diff"] = df["r_adj_win_rate"] - df["b_adj_win_rate"]
-
         self.df = df
         print_metric("Feature columns added:", len(df.columns))
 
@@ -2650,21 +2458,18 @@ class UFCPredictor:
         diag_start = int(n * 0.80)
         df_val  = df_train.iloc[diag_start:train_end]
 
-        # Corner-swap augmentation removed — D+I decomposition handles antisymmetry
-        # mathematically. Each original fight generates D = (r-b)/2 (negated on swap)
-        # and I = (r+b)/2 (invariant), giving both orientations implicitly.
-        # Removing explicit augmentation preserves the genuine red-corner advantage
-        # signal (~56-58% UFC red wins) instead of forcing artificial symmetry.
-        df_tr_aug = df_tr   # no augmentation; alias kept for compatibility
+        # Corner-swap augmentation on train set
+        df_aug = self._corner_swap(df_tr)
+        df_tr_aug = pd.concat([df_tr, df_aug], ignore_index=True)
 
-        X_tr, y_tr, feat_cols = self._build_X_y(df_tr)
+        X_tr, y_tr, feat_cols = self._build_X_y(df_tr_aug)
         X_val, y_val, _ = self._build_X_y(df_val)
         self.feature_cols = feat_cols
 
-        print_metric("Train samples:", len(X_tr))
+        print_metric("Train samples (augmented):", len(X_tr))
         print_metric("Diag window samples (in-training):", len(X_val))
         print_metric("Test samples (holdout):", len(df_test))
-        print_metric("Features (pre-decomposition):", len(feat_cols))
+        print_metric("Features:", len(feat_cols))
 
         # ── Antisymmetric feature decomposition (D + I) ───────────────────
         print_step("Applying antisymmetric feature decomposition (D + I)...")
@@ -2700,114 +2505,56 @@ class UFCPredictor:
         y_val  = np.array([1 if w == "Red" else 0 for w in df_val_feat["winner"].values])
         y_test = np.array([1 if w == "Red" else 0 for w in df_test_feat["winner"].values])
 
-        # Recency weighting (λ=0.10/year).
-        # exp(-0.10 × 15) ≈ 0.22 — oldest fights weighted ~22% of most recent.
-        # Applied UNIFORMLY to OOF fold clones AND final base-model fits so there
-        # is no OOF/final calibration mismatch.
-        _event_dates = df_train_feat["event_date"] if "event_date" in df_train_feat.columns else None
-        if _event_dates is not None and _event_dates.notna().any():
-            _max_date   = _event_dates.max()
-            _years_back = (_max_date - _event_dates).dt.days.fillna(0).values / 365.0
-            sw_tr = np.exp(-0.10 * _years_back)
-            sw_tr = (sw_tr / sw_tr.mean()).astype(np.float32)
-        else:
-            sw_tr = None
-
         # Scale
         X_tr_s   = self.scaler.fit_transform(X_tr_raw)
         X_val_s  = self.scaler.transform(X_val_raw)
         X_test_s = self.scaler.transform(X_test_raw)
 
-        # Three-stage feature selection: filter → filter → wrapper
-        #
-        #   Stage 1 — VarianceThreshold: removes near-constant columns (std < 0.032).
-        #
-        #   Stage 2 — MI pre-filter: score all survivors with mutual_info_classif,
-        #             then discard the bottom 30% (clearly uninformative).  MI is
-        #             fast and model-agnostic but treats features independently —
-        #             it cannot detect redundancy between correlated features.
-        #             This stage is a coarse sieve only.
-        #
-        #   Stage 3 — L1-penalised LogisticRegression (SelectFromModel):
-        #             fits a sparse linear model on the MI-survivors.  L1 penalty
-        #             forces correlated features to compete for non-zero coefficients,
-        #             so genuinely redundant features are automatically zeroed out.
-        #             "threshold='mean'" keeps features with |coef| above the mean,
-        #             giving a principled, data-driven final set.
-        #
-        # This filter+wrapper combination is strictly better than pure MI selection:
-        # MI cannot handle redundancy; L1-LR cannot handle a 1000-feature noisy
-        # space efficiently.  Together they give a compact, non-redundant feature set.
-        from sklearn.feature_selection import (
-            VarianceThreshold, mutual_info_classif as _mic_fn, SelectFromModel as _SFM
-        )
-        from sklearn.linear_model import LogisticRegression as _LR_sel
+        # Track D-feature indices (no _inv suffix) for corner bias diagnostic
+        self._d_indices = [i for i, c in enumerate(self._decomposed_cols) if not c.endswith('_inv')]
 
-        # Stage 1: variance filter
-        _vt = VarianceThreshold(threshold=1e-3)
-        X_tr_vt   = _vt.fit_transform(X_tr_s)
-        X_val_vt  = _vt.transform(X_val_s)
-        X_test_vt = _vt.transform(X_test_s)
-        print_metric("Features after variance filter:", X_tr_vt.shape[1])
-
-        # Stage 2: MI pre-filter — remove bottom 30% (noise floor)
-        _mi_scores_raw = _mic_fn(X_tr_vt, y_tr, random_state=RANDOM_SEED)
-        _mi_cutoff = float(np.percentile(_mi_scores_raw, 30))
-        _mi_mask   = _mi_scores_raw >= _mi_cutoff
-        X_tr_mi   = X_tr_vt[:, _mi_mask]
-        X_val_mi  = X_val_vt[:, _mi_mask]
-        X_test_mi = X_test_vt[:, _mi_mask]
-        print_metric("Features after MI pre-filter (top 70% by MI):", X_tr_mi.shape[1])
-
-        # Stage 3: L1-LR wrapper — eliminates redundant survivors
-        # C=0.05 gives moderate sparsity; class_weight='balanced' handles UFC
-        # red-corner win imbalance without biasing the coefficient selection.
-        _l1_selector = _SFM(
-            _LR_sel(
-                C=0.05, penalty='l1', solver='liblinear', max_iter=300,
-                random_state=RANDOM_SEED, class_weight='balanced',
-            ),
-            threshold='mean',   # keep features with |coef| >= mean |coef|
-        )
-        _l1_selector.fit(X_tr_mi, y_tr)
-        X_tr_sel   = _l1_selector.transform(X_tr_mi)
-        X_val_sel  = _l1_selector.transform(X_val_mi)
-        X_test_sel = _l1_selector.transform(X_test_mi)
-        print_metric("Features after L1-LR wrapper selection:", X_tr_sel.shape[1])
-
-        # Map surviving indices back to decomposed column names for diagnostics
-        _vt_idxs   = np.where(_vt.get_support())[0]
-        _mi_idxs   = np.where(_mi_mask)[0]
-        _l1_idxs   = np.where(_l1_selector.get_support())[0]
-        _final_idxs = _vt_idxs[_mi_idxs[_l1_idxs]]
-        _sel_cols   = [self._decomposed_cols[i] for i in _final_idxs
-                       if i < len(self._decomposed_cols)]
-        self._selected_decomposed_cols = _sel_cols
-
-        # Wrap all three stages so prediction-time transform() stays consistent
-        class _ThreeStageSelector:
-            def __init__(self, vt, mi_mask, l1):
-                self._vt, self._mi_mask, self._l1 = vt, mi_mask, l1
-            def transform(self, X):
-                X_vt = self._vt.transform(X)
-                X_mi = X_vt[:, self._mi_mask]
-                return self._l1.transform(X_mi)
-
-        self._global_selector = _ThreeStageSelector(_vt, _mi_mask, _l1_selector)
-
-        # Recompute D-feature indices relative to the SELECTED feature set so the
-        # corner bias diagnostic flips the right columns in the 600-d space.
-        # Exclude fight-level invariants (is_title, total_rounds, gender, etc.) —
-        # these are symmetric by construction and flipping them in the corner-bias
-        # diagnostic only adds noise without exposing true directional bias.
-        _FIGHT_LEVEL_INVARIANTS = {
-            'is_title_enc', 'total_rounds_num', 'gender_enc',
-            'weight_class_ko_factor', 'weight_class_enc',
-        }
+        # Global model-based feature selection — keep top 50% of the 1200
+        # decomposed features by LightGBM split-count importance.
+        # ANOVA F-score (the univariate alternative) only detects linear
+        # correlations; LGB importance captures feature interactions and
+        # non-linear signal (e.g. age has a non-linear relationship with
+        # performance).  A lightweight LGB (100 trees) is trained purely to rank
+        # features; it is completely separate from the Optuna-tuned LGB in the
+        # ensemble.
+        print_step("Running model-based feature selection (LGB importance, top 50%)...")
+        from sklearn.feature_selection import SelectFromModel as _SFM
+        if HAS_LGB:
+            _sel_lgb = lgb.LGBMClassifier(
+                n_estimators=100, num_leaves=31, max_depth=5,
+                learning_rate=0.1, subsample=0.8, colsample_bytree=0.8,
+                random_state=RANDOM_SEED, verbose=-1, n_jobs=SAFE_N_JOBS,
+            )
+            _sel_lgb.fit(X_tr_s, y_tr)
+            # Use max_features to guarantee exactly top 50% by count.
+            # threshold="median" fails when median importance=0 (>50% zero-importance
+            # features), causing SelectFromModel to keep all 1200 features.
+            _n_keep = X_tr_s.shape[1] // 2
+            self._global_selector = _SFM(
+                _sel_lgb, prefit=True, max_features=_n_keep, threshold=-np.inf
+            )
+        else:
+            # Fallback: ANOVA F-score when LGB unavailable
+            from sklearn.feature_selection import SelectPercentile as _SP, f_classif as _fc
+            _sp = _SP(_fc, percentile=50)
+            _sp.fit(X_tr_s, y_tr)
+            self._global_selector = _sp
+        X_tr_sel   = self._global_selector.transform(X_tr_s)
+        X_val_sel  = self._global_selector.transform(X_val_s)
+        X_test_sel = self._global_selector.transform(X_test_s)
+        _gsel_idx  = self._global_selector.get_support(indices=True)
+        # Subset of decomposed column names that survived selection
+        self._selected_decomposed_cols = [self._decomposed_cols[i] for i in _gsel_idx]
+        # Recompute D-feature indices within the reduced feature space
         self._d_indices = [
-            i for i, c in enumerate(_sel_cols)
-            if not c.endswith('_inv') and c not in _FIGHT_LEVEL_INVARIANTS
+            new_i for new_i, orig_i in enumerate(_gsel_idx)
+            if not self._decomposed_cols[orig_i].endswith('_inv')
         ]
+        print_metric("Features after model-based selection:", X_tr_sel.shape[1])
 
         # ── TimeSeriesSplit cross-validation ──────────────────────────────
         t0_cv = time.time()
@@ -2815,14 +2562,8 @@ class UFCPredictor:
         tscv = TimeSeriesSplit(n_splits=5)
         fold_scores = []
         for fold, (tr_idx, val_idx) in enumerate(tscv.split(X_tr_sel), 1):
-            # LR proxy: fast, regularised, honest estimate of the feature set's
-            # signal.  The old unregularised RF was overfitting in-fold, making
-            # CV scores ~4-6% higher than the actual stacking model on the test
-            # set and masking the true train/test gap.
-            fold_rf = LogisticRegression(
-                C=0.1, max_iter=500, solver="lbfgs",
-                class_weight="balanced", random_state=42,
-            )
+            # use RandomForest as quick CV estimator
+            fold_rf = RandomForestClassifier(n_estimators=100, n_jobs=SAFE_N_JOBS, random_state=42)
             fold_rf.fit(X_tr_sel[tr_idx], y_tr[tr_idx])
             fold_pred = fold_rf.predict_proba(X_tr_sel[val_idx])[:, 1]
             fold_acc = (fold_rf.predict(X_tr_sel[val_idx]) == y_tr[val_idx]).mean()
@@ -2842,7 +2583,7 @@ class UFCPredictor:
                     # Cap n_estimators at 1000: with low learning rates (0.005),
                     # 2000 trees can memorize a small UFC dataset. 1000 is sufficient.
                     'n_estimators': trial.suggest_int('n_estimators', 200, 1000),
-                    'max_depth': trial.suggest_int('max_depth', 3, 5),
+                    'max_depth': trial.suggest_int('max_depth', 3, 8),
                     'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.15, log=True),
                     'subsample': trial.suggest_float('subsample', 0.6, 1.0),
                     'colsample_bytree': trial.suggest_float('colsample_bytree', 0.5, 1.0),
@@ -2867,7 +2608,6 @@ class UFCPredictor:
                 scores = []
                 for tr_i, val_i in tscv3.split(X_tr_sel):
                     xgb_trial.fit(X_tr_sel[tr_i], y_tr[tr_i],
-                                  sample_weight=sw_tr[tr_i] if sw_tr is not None else None,
                                   eval_set=[(X_tr_sel[val_i], y_tr[val_i])],
                                   verbose=False)
                     p = xgb_trial.predict_proba(X_tr_sel[val_i])[:, 1]
@@ -2880,7 +2620,7 @@ class UFCPredictor:
                 sampler=optuna.samplers.TPESampler(seed=RANDOM_SEED),
             )
 
-            N_TRIALS = 25
+            N_TRIALS = 25  # TEMP: speed test (restore to 25)
             _optuna_best_so_far = [None]
 
             def _optuna_callback(study, trial):
@@ -2918,13 +2658,13 @@ class UFCPredictor:
         if HAS_OPTUNA and HAS_LGB:
             print_step("Running Optuna hyperparameter search for LightGBM (15 trials)...")
             lgb_optuna_start = time.time()
-            LGB_TRIALS = 15
+            LGB_TRIALS = 15  # TEMP: speed test (restore to 15)
 
             def lgb_optuna_objective(trial):
                 params = {
                     "n_estimators": trial.suggest_int("n_estimators", 200, 1000),
-                    "num_leaves": trial.suggest_int("num_leaves", 15, 31),
-                    "max_depth": trial.suggest_int("max_depth", 3, 6),
+                    "num_leaves": trial.suggest_int("num_leaves", 15, 63),
+                    "max_depth": trial.suggest_int("max_depth", 3, 8),
                     "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.1, log=True),
                     "min_child_samples": trial.suggest_int("min_child_samples", 15, 50),
                     "reg_alpha": trial.suggest_float("reg_alpha", 0.0, 5.0),
@@ -2940,8 +2680,7 @@ class UFCPredictor:
                 tscv3 = TimeSeriesSplit(n_splits=3)
                 scores = []
                 for tr_i, val_i in tscv3.split(X_tr_sel):
-                    lgb_trial.fit(X_tr_sel[tr_i], y_tr[tr_i],
-                                  sample_weight=sw_tr[tr_i] if sw_tr is not None else None)
+                    lgb_trial.fit(X_tr_sel[tr_i], y_tr[tr_i])
                     p = lgb_trial.predict_proba(X_tr_sel[val_i])[:, 1]
                     scores.append(-log_loss(y_tr[val_i], p))
                 return np.mean(scores)
@@ -2976,32 +2715,30 @@ class UFCPredictor:
 
         # ── Optuna hyperparameter tuning for CatBoost ─────────────────────
         if HAS_OPTUNA and HAS_CAT:
-            print_step("Running Optuna hyperparameter search for CatBoost (15 trials)...")
-            cat_optuna_start = time.time()
             CAT_TRIALS = 15
+            print_step(f"Running Optuna hyperparameter search for CatBoost ({CAT_TRIALS} trials)...")
+            cat_optuna_start = time.time()
 
             def cat_optuna_objective(trial):
                 params = {
-                    "iterations":         trial.suggest_int("iterations", 200, 400),
-                    "depth":              trial.suggest_int("depth", 3, 5),
-                    "learning_rate":      trial.suggest_float("learning_rate", 0.01, 0.1, log=True),
-                    "l2_leaf_reg":        trial.suggest_float("l2_leaf_reg", 10.0, 40.0),
-                    "bagging_temperature":trial.suggest_float("bagging_temperature", 0.0, 1.5),
-                    "random_strength":    trial.suggest_float("random_strength", 0.5, 3.0),
+                    "iterations": trial.suggest_int("iterations", 200, 600),
+                    "depth": trial.suggest_int("depth", 4, 7),
+                    "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.1, log=True),
+                    "l2_leaf_reg": trial.suggest_float("l2_leaf_reg", 1.0, 15.0),
+                    "bagging_temperature": trial.suggest_float("bagging_temperature", 0.0, 1.0),
+                    "random_strength": trial.suggest_float("random_strength", 0.5, 3.0),
                 }
+                if self.gpu_info.get("cat"):
+                    params["task_type"] = "GPU"
                 cat_trial = cb.CatBoostClassifier(
                     **params,
-                    random_seed=42, verbose=0,
-                    eval_metric="Logloss",
-                    auto_class_weights="Balanced",
+                    random_seed=RANDOM_SEED, verbose=0,
+                    eval_metric="Logloss", auto_class_weights="Balanced",
                 )
-                if self.gpu_info.get("cat"):
-                    cat_trial.set_params(task_type="GPU")
                 tscv3 = TimeSeriesSplit(n_splits=3)
                 scores = []
                 for tr_i, val_i in tscv3.split(X_tr_sel):
-                    cat_trial.fit(X_tr_sel[tr_i], y_tr[tr_i],
-                                  sample_weight=sw_tr[tr_i] if sw_tr is not None else None)
+                    cat_trial.fit(X_tr_sel[tr_i], y_tr[tr_i])
                     p = cat_trial.predict_proba(X_tr_sel[val_i])[:, 1]
                     scores.append(-log_loss(y_tr[val_i], p))
                 return np.mean(scores)
@@ -3026,75 +2763,52 @@ class UFCPredictor:
                 show_progress_bar=False, callbacks=[_cat_callback],
             )
             print()
-            cat_best_params = cat_study.best_params
             cat_elapsed = time.time() - cat_optuna_start
             print_metric("CAT Optuna best log-loss:", f"{-cat_study.best_value:.4f}")
             print_metric("Time elapsed:", f"{cat_elapsed:.1f}s")
-            self._optuna_best_cat_params = cat_best_params
+            self._optuna_best_cat_params = cat_study.best_params
         else:
             self._optuna_best_cat_params = {}
 
         # Build and fit base estimators — these fitted copies are used for the
         # per-model val accuracy display and cloned into the stacking ensemble.
         t0_estimators = time.time()
-        estimators = self._build_estimators(X_tr_sel, y_tr, sample_weight=sw_tr)
+        estimators = self._build_estimators(X_tr_sel, y_tr)
         print_metric("Base estimators time:", f"{time.time()-t0_estimators:.1f}s")
 
-        # ── Manual OOF stacking with TimeSeriesSplit ────────────────────────
+        # ── Manual OOF stacking with KFold-3 ───────────────────────────────
         # Replaces StackingClassifier to fix the NaN stacking bug: sklearn's
         # StackingClassifier uses cross_val_predict internally, which produces
         # NaN meta-features for rf/mlp/cat in our setup, leaving those models
         # with NaN LR coefficients and making them useless.  _ManualStackingEnsemble
-        # does the same OOF stacking explicitly with TimeSeriesSplit (preserving
-        # temporal order), catching NaN/exceptions per model per fold so all
-        # base models contribute valid meta-features.
-        print_step("Building stacking ensemble (manual TimeSeriesSplit OOF meta-learning)...")
+        # does the same KFold-3 OOF stacking explicitly, catching NaN/exceptions
+        # per model per fold so all 6 base models contribute valid meta-features.
+        print_step("Building stacking ensemble (manual KFold-3 OOF meta-learning)...")
         t0_stack = time.time()
         _stk = _ManualStackingEnsemble(
             estimators=estimators,   # already fitted by _build_estimators
             meta_C=0.05,
-            n_splits=5,   # 5-fold: each OOF model trains on 80% vs 66% with 3-fold
+            n_splits=3,
             random_state=RANDOM_SEED,
         )
-        # Augmentation removed, so all rows are original — no slicing needed.
-        _stk.fit(X_tr_sel, y_tr, sample_weight=sw_tr)
-
-        # Isotonic calibration removed: fitting on oof_meta_X_ uses the
-        # meta-learner's own training data (in-sample), so the calibrator
-        # learns training residuals rather than generalisation errors and
-        # inflates log-loss on the test set.  The XGB meta-learner with
-        # strong regularisation (reg_alpha=5, reg_lambda=10) is already
-        # well-calibrated without a post-hoc isotonic step.
-
+        _stk.fit(X_tr_sel, y_tr)
         # Store for downstream use
         self._base_ensemble = _stk
         self.stacking_clf   = _stk
 
-        # Show meta-learner contributions
+        # Show meta-learner coefficients (model contributions)
         try:
-            _meta      = _stk.final_estimator_
-            _est_names = [n for n, _ in estimators]
-            nc         = len(_stk.classes_)
+            _meta = _stk.final_estimator_
             if hasattr(_meta, "coef_"):
-                # LR fallback — show class-1 probability coefficients
-                _coefs = _meta.coef_[0]
+                _coefs     = _meta.coef_[0]
+                _est_names = [n for n, _ in estimators]
+                nc         = len(_stk.classes_)
                 print_step("Meta-learner model contributions "
                            "(LR coef on class-1 probability column):")
                 for _ei, _ename in enumerate(_est_names):
-                    _ci = _ei * nc + 1
+                    _ci = _ei * nc + 1   # class-1 column
                     _c  = float(_coefs[_ci]) if _ci < len(_coefs) else float("nan")
                     print(f"    {_ename:<6s}  coef={_c:+.4f}")
-            elif hasattr(_meta, "feature_importances_"):
-                # XGB meta-learner — show per-model importance (sum class-0 + class-1)
-                _imp = _meta.feature_importances_
-                print_step("Meta-learner model contributions "
-                           "(XGB importance, sum of both class columns):")
-                for _ei, _ename in enumerate(_est_names):
-                    _i0 = _ei * nc
-                    _i1 = _ei * nc + 1
-                    _v0 = float(_imp[_i0]) if _i0 < len(_imp) else 0.0
-                    _v1 = float(_imp[_i1]) if _i1 < len(_imp) else 0.0
-                    print(f"    {_ename:<6s}  importance={_v0 + _v1:.4f}")
         except Exception:
             pass
         print_metric("Stacking ensemble time:", f"{time.time()-t0_stack:.1f}s")
@@ -4331,20 +4045,14 @@ class UFCPredictor:
         _b_tact = df.get("b_pre_tactical_evolution", pd.Series(0.0, index=df.index)).fillna(0.0)
         df["tactical_evolution_score_diff"] = _r_tact - _b_tact
 
-        # Tier 29 additional
-        df["rematch_prior_edge"] = df.get("prior_winner_is_red", pd.Series(0.0, index=df.index)).fillna(0.0) * \
-                                   df.get("is_rematch", pd.Series(0.0, index=df.index)).fillna(0.0)
-        if "r_adj_win_rate" in df.columns and "b_adj_win_rate" in df.columns:
-            df["adj_win_rate_diff"] = df["r_adj_win_rate"] - df["b_adj_win_rate"]
-
         return df
 
-    def _build_estimators(self, X_tr, y_tr, sample_weight=None):
+    def _build_estimators(self, X_tr, y_tr):
         from sklearn.pipeline import Pipeline as _Pipeline
         from sklearn.feature_selection import SelectPercentile, f_classif
+        from sklearn.neural_network import MLPClassifier
 
         estimators = []
-        sw = np.asarray(sample_weight) if sample_weight is not None else None
 
         # Class imbalance ratio — used by XGBoost (scale_pos_weight) and CatBoost
         n_pos = max(int(np.sum(y_tr == 1)), 1)
@@ -4363,8 +4071,6 @@ class UFCPredictor:
                 n_jobs=SAFE_N_JOBS, class_weight="balanced", solver="lbfgs",
             ))
         ])
-        # LR Pipeline does not support sample_weight through Pipeline.fit in all
-        # sklearn versions — fit without it; it uses class_weight="balanced" instead.
         lr_pipe.fit(X_tr, y_tr)
         estimators.append(("lr", lr_pipe))
 
@@ -4388,13 +4094,13 @@ class UFCPredictor:
             if self.gpu_info.get("xgb"):
                 xgb_params["device"] = "cuda"
             clf = xgb.XGBClassifier(**xgb_params)
-            clf.fit(X_tr, y_tr, sample_weight=sw)
+            clf.fit(X_tr, y_tr)
             estimators.append(("xgb", clf))
 
         # LightGBM — Optuna-tuned params used if available, else conservative defaults
         if HAS_LGB:
             lgb_params = {
-                "n_estimators": 500, "num_leaves": 31, "max_depth": 6,
+                "n_estimators": 500, "num_leaves": 31, "max_depth": -1,
                 "learning_rate": 0.05, "subsample": 0.8,
                 "colsample_bytree": 0.8, "min_child_samples": 30,
                 "reg_alpha": 0.5, "reg_lambda": 1.0,
@@ -4404,35 +4110,42 @@ class UFCPredictor:
             if hasattr(self, '_optuna_best_lgb_params') and self._optuna_best_lgb_params:
                 lgb_params.update(self._optuna_best_lgb_params)
             clf = lgb.LGBMClassifier(**lgb_params)
-            clf.fit(X_tr, y_tr, sample_weight=sw)
+            clf.fit(X_tr, y_tr)
             estimators.append(("lgb", clf))
 
-        # Random Forest — constrained to prevent memorisation.
-        # With 600 features and ~5700 augmented training samples, depth=12 and
-        # min_samples_leaf=3 still yielded ~96% in-sample accuracy.
-        # Increasing min_samples_leaf to 8 forces each leaf to cover at least
-        # 8 samples, significantly reducing overfitting while keeping the
-        # model deep enough to capture real interactions.
+        # Random Forest — max_depth=12 prevents extreme depth in 1200-feature space.
+        # Unlimited depth (None) with 1200 features produces very deep trees that
+        # memorize training data and generalize poorly; depth 12 is a hard cap.
         rf = RandomForestClassifier(
-            n_estimators=300, max_depth=7, min_samples_split=20,
-            min_samples_leaf=25, max_features="sqrt",
+            n_estimators=300, max_depth=12, min_samples_split=6,
+            min_samples_leaf=3, max_features="sqrt",
             random_state=RANDOM_SEED, n_jobs=1, class_weight="balanced"
         )
-        rf.fit(X_tr, y_tr, sample_weight=sw)
+        rf.fit(X_tr, y_tr)
         estimators.append(("rf", rf))
 
-        # MLP removed: its meta-learner coefficient was consistently negative,
-        # meaning the stacking LR was betting against its predictions. MLPs
-        # require careful tuning (learning rate, depth, regularization) on
-        # tabular data and are not worth the noise in this ensemble without it.
+        # MLP — SelectPercentile reduces 1200 features to ~480 so the network
+        # doesn't collapse under high-dimensional noise
+        mlp_pipe = _Pipeline([
+            ("selector", SelectPercentile(f_classif, percentile=40)),
+            ("mlp", MLPClassifier(
+                hidden_layer_sizes=(256, 128, 64), activation="relu",
+                solver="adam", alpha=5e-4, batch_size=64,
+                learning_rate_init=1e-3, max_iter=300,
+                early_stopping=True, validation_fraction=0.1,
+                random_state=RANDOM_SEED
+            )),
+        ])
+        mlp_pipe.fit(X_tr, y_tr)
+        estimators.append(("mlp", mlp_pipe))
 
         # CatBoost — more conservative regularization for small UFC dataset.
         # Original depth=6, iterations=500, l2=3 overfit on ~600 training fights;
         # depth=5, iterations=300, l2=8 prevents memorization.
         if HAS_CAT:
             cat_params = {
-                "iterations": 250, "depth": 4, "learning_rate": 0.05,
-                "l2_leaf_reg": 25, "bagging_temperature": 0.8,
+                "iterations": 300, "depth": 5, "learning_rate": 0.05,
+                "l2_leaf_reg": 8, "bagging_temperature": 0.8,
                 "random_strength": 1.5,
                 "random_seed": RANDOM_SEED, "verbose": 0,
                 "eval_metric": "Logloss",
@@ -4443,7 +4156,7 @@ class UFCPredictor:
             if self.gpu_info.get("cat"):
                 cat_params["task_type"] = "GPU"
             clf = cb.CatBoostClassifier(**cat_params)
-            clf.fit(X_tr, y_tr, sample_weight=sw)
+            clf.fit(X_tr, y_tr)
             estimators.append(("cat", clf))
 
         return estimators
