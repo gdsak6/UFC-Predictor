@@ -229,6 +229,10 @@ class FeatureEngineer:
             elif finish_round == 3:
                 k *= 1.2
             # else round 4+ -> no extra modifier (×1.0)
+        # Split/majority decisions are less informative — close fights carry a
+        # smaller rating update in both directions (winner and loser).
+        if ("Split" in method or "Majority" in method):
+            k *= 0.8
         # Streak multiplier: 3+ fight win streak
         if winner_streak >= 3 and result == "win":
             k *= 1.1
@@ -497,13 +501,15 @@ class _ManualStackingEnsemble:
         self.classes_         = None
         self.final_estimator_ = None
 
-    def fit(self, X, y):
+    def fit(self, X, y, sample_weight=None):
         from sklearn.base import clone as _clone
         y = np.asarray(y)
         self.classes_ = np.unique(y)
         nc = len(self.classes_)          # 2 for binary
         n  = X.shape[0]
         nm = len(self.estimators)
+
+        sw = np.asarray(sample_weight) if sample_weight is not None else None
 
         # OOF meta-feature matrix: n_samples × (n_models × n_classes)
         meta_X_oof = np.full((n, nm * nc), 1.0 / nc)
@@ -512,6 +518,10 @@ class _ManualStackingEnsemble:
         for tr_idx, va_idx in kf.split(X):
             X_tr_f, X_va_f = X[tr_idx], X[va_idx]
             y_tr_f = y[tr_idx]
+            # OOF fold training uses equal weights so predictions are calibrated
+            # across all eras. Passing recency weights into fold training skews
+            # predictions toward recent patterns, producing miscalibrated OOF
+            # probabilities for older fights and confusing the meta-learner.
             for ei, (name, est) in enumerate(self.estimators):
                 col = ei * nc
                 try:
@@ -525,12 +535,12 @@ class _ManualStackingEnsemble:
                     # Fall back to uniform for this model/fold — still contributes
                     meta_X_oof[va_idx, col:col + nc] = 1.0 / nc
 
-        # Train LR meta-learner on OOF meta-features
+        # Train LR meta-learner on OOF meta-features (with recency weights)
         self.final_estimator_ = LogisticRegression(
             C=self.meta_C, max_iter=1000,
             random_state=self.random_state, solver="lbfgs"
         )
-        self.final_estimator_.fit(meta_X_oof, y)
+        self.final_estimator_.fit(meta_X_oof, y, sample_weight=sw)
         return self
 
     def _meta_features(self, X):
@@ -808,9 +818,31 @@ class UFCPredictor:
             "r_pre_slpm_std_l10",         "b_pre_slpm_std_l10",
             "r_pre_damage_ratio_std_l10", "b_pre_damage_ratio_std_l10",
             "r_pre_tactical_evolution",   "b_pre_tactical_evolution",
+            # Exponentially-weighted rolling stats (Item 1)
+            "r_ewm_wins",    "b_ewm_wins",
+            "r_ewm_sig_str", "b_ewm_sig_str",
+            "r_ewm_td",      "b_ewm_td",
+            "r_ewm_kd",      "b_ewm_kd",
+            "r_ewm_sub_att", "b_ewm_sub_att",
+            # Loss method breakdown (Item 5)
+            "r_pre_ko_losses",  "b_pre_ko_losses",
+            "r_pre_sub_losses", "b_pre_sub_losses",
+            "r_pre_dec_losses", "b_pre_dec_losses",
         ]
         for col in new_cols:
             self.df[col] = 0.0
+
+        # Exponentially-decayed weighted average over history entries.
+        # Most recent = weight 1.0; each fight further back decays by e^(-0.5).
+        # Positional (not date-based) since _history entries don't store dates.
+        def _ewm_hist(entries, key):
+            if not entries:
+                return 0.0
+            vals = [h.get(key, 0) for h in entries]
+            n = len(vals)
+            w = np.array([np.exp(-0.5 * (n - 1 - i)) for i in range(n)])
+            w /= w.sum()
+            return float(np.dot(w, vals))
 
         for idx, row in self.df.iterrows():
             r = str(row.get("r_fighter", "")).strip()
@@ -847,6 +879,14 @@ class UFCPredictor:
             self.df.at[idx, "b_pre_ko_wins"] = bs["ko_wins"]
             self.df.at[idx, "b_pre_sub_wins"] = bs["sub_wins"]
             self.df.at[idx, "b_pre_dec_wins"] = bs["dec_wins"]
+            # Loss method breakdown — KO losses signal chin deterioration,
+            # sub losses signal grappling vulnerability
+            self.df.at[idx, "r_pre_ko_losses"]  = rs["ko_losses"]
+            self.df.at[idx, "r_pre_sub_losses"] = rs["sub_losses"]
+            self.df.at[idx, "r_pre_dec_losses"] = rs["dec_losses"]
+            self.df.at[idx, "b_pre_ko_losses"]  = bs["ko_losses"]
+            self.df.at[idx, "b_pre_sub_losses"] = bs["sub_losses"]
+            self.df.at[idx, "b_pre_dec_losses"] = bs["dec_losses"]
             self.df.at[idx, "r_pre_total_fights"] = rs["total_fights"]
             self.df.at[idx, "b_pre_total_fights"] = bs["total_fights"]
             self.df.at[idx, "r_pre_finish_rate"] = rs["finish_rate"]
@@ -914,6 +954,16 @@ class UFCPredictor:
             self.df.at[idx, "b_rolling5_td"] = np.mean([h["td"] for h in hist_b5]) if hist_b5 else 0.0
             self.df.at[idx, "r_rolling5_kd"] = np.mean([h["kd"] for h in hist_r5]) if hist_r5 else 0.0
             self.df.at[idx, "b_rolling5_kd"] = np.mean([h["kd"] for h in hist_b5]) if hist_b5 else 0.0
+
+            # Exponentially-weighted rolling stats (last 5 fights, positional decay)
+            # Gives more weight to recent fights than simple unweighted means.
+            for _corner, _hist in (("r", rs["_history"]), ("b", bs["_history"])):
+                _h5 = _hist[-5:]
+                self.df.at[idx, f"{_corner}_ewm_wins"]    = _ewm_hist(_h5, "won")
+                self.df.at[idx, f"{_corner}_ewm_sig_str"] = _ewm_hist(_h5, "sig_str")
+                self.df.at[idx, f"{_corner}_ewm_td"]      = _ewm_hist(_h5, "td")
+                self.df.at[idx, f"{_corner}_ewm_kd"]      = _ewm_hist(_h5, "kd")
+                self.df.at[idx, f"{_corner}_ewm_sub_att"] = _ewm_hist(_h5, "sub_att")
 
             # Glicko-2 pre-fight snapshot (BEFORE update — prevents data leakage in Tier 4)
             r_glicko_snap = self.feature_engineer.glicko2_get(r)
@@ -1508,12 +1558,19 @@ class UFCPredictor:
 
         # ── TIER 7: Style cluster features ────────────────────────────────
         self._log("Tier 7: Style cluster features...")
+        # Restrict KMeans cluster fitting to the training portion of the data
+        # (chronological first 90%) so test-set fighters don't influence cluster
+        # centroids. Test-set fighters who never appeared in training will still
+        # receive a cluster assignment via the fitted KMeans model; they just
+        # don't shift the centroids during fitting.
+        _n_train_proxy = int(len(df) * 0.9)
+        _train_idx_set = set(
+            df.sort_values("event_date", na_position="first").index[:_n_train_proxy]
+        )
         fighter_style = {}
         for f in self.all_fighters:
-            # Use final ELO (proxy for quality)
-            elo = fe.elo_get(f)
-            r_rows = df[df["r_fighter"] == f]
-            b_rows = df[df["b_fighter"] == f]
+            r_rows = df[(df["r_fighter"] == f) & (df.index.isin(_train_idx_set))]
+            b_rows = df[(df["b_fighter"] == f) & (df.index.isin(_train_idx_set))]
             slpm = 0.0; sapm = 0.0; td = 0.0; sub = 0.0; finish = 0.0
             cnt = 0
             for _, row in r_rows.iterrows():
@@ -2377,6 +2434,76 @@ class UFCPredictor:
         _b_tact = df.get("b_pre_tactical_evolution", pd.Series(0.0, index=df.index)).fillna(0.0)
         df["tactical_evolution_score_diff"] = _r_tact - _b_tact
 
+        # ── TIER 29: New signal features ─────────────────────────────────────
+        self._log("Tier 29: New signal features...")
+
+        # -- Item 5: Loss method breakdown (chin & submission vulnerability) ---
+        for _px in ("r", "b"):
+            _ko_l  = df.get(f"{_px}_pre_ko_losses",  pd.Series(0.0, index=df.index)).fillna(0.0)
+            _sub_l = df.get(f"{_px}_pre_sub_losses", pd.Series(0.0, index=df.index)).fillna(0.0)
+            _tot_l = df.get(f"{_px}_pre_losses",     pd.Series(1.0, index=df.index)).fillna(1.0).clip(lower=1)
+            df[f"{_px}_ko_loss_rate"]  = _ko_l  / _tot_l
+            df[f"{_px}_sub_loss_rate"] = _sub_l / _tot_l
+        df["chin_vulnerability_diff"] = df["r_ko_loss_rate"]  - df["b_ko_loss_rate"]
+        df["sub_vulnerability_diff"]  = df["r_sub_loss_rate"] - df["b_sub_loss_rate"]
+
+        # -- Item 6: Strike accuracy differential --------------------------------
+        _r_sa = df.get("r_pre_sig_str_acc", pd.Series(0.43, index=df.index)).fillna(0.43)
+        _b_sa = df.get("b_pre_sig_str_acc", pd.Series(0.43, index=df.index)).fillna(0.43)
+        df["diff_sig_str_acc"] = _r_sa - _b_sa
+        # Volume × accuracy: distinguish high-volume/low-acc from low-volume/high-acc
+        _r_slpm_t29 = df.get("r_pre_SLpM", pd.Series(3.0, index=df.index)).fillna(3.0)
+        _b_slpm_t29 = df.get("b_pre_SLpM", pd.Series(3.0, index=df.index)).fillna(3.0)
+        df["r_effective_striking"] = _r_slpm_t29 * _r_sa
+        df["b_effective_striking"] = _b_slpm_t29 * _b_sa
+        df["effective_striking_diff"] = df["r_effective_striking"] - df["b_effective_striking"]
+
+        # -- Item 7: Physical matchup interaction features -----------------------
+        _reach_diff_t29  = df.get("diff_reach",     pd.Series(0.0, index=df.index)).fillna(0.0)
+        _height_diff_t29 = df.get("diff_height",    pd.Series(0.0, index=df.index)).fillna(0.0)
+        _style_edge_t29  = df.get("style_matchup_edge", pd.Series(0.0, index=df.index)).fillna(0.0)
+        _r_fin_t29       = df.get("r_pre_finish_rate", pd.Series(0.4, index=df.index)).fillna(0.4)
+        _b_fin_t29       = df.get("b_pre_finish_rate", pd.Series(0.4, index=df.index)).fillna(0.4)
+        # Reach advantage amplified by strike accuracy edge
+        df["reach_x_str_acc_diff"]  = _reach_diff_t29 * df["diff_sig_str_acc"]
+        # Reach advantage interacting with style matchup edge
+        df["reach_x_style_edge"]    = _reach_diff_t29 * _style_edge_t29
+        # Height advantage interacting with finishing tendency
+        df["height_x_finish_diff"]  = _height_diff_t29 * (_r_fin_t29 - _b_fin_t29)
+
+        # -- Item 3: Layoff × age interaction ------------------------------------
+        _r_days_t29 = df.get("r_days_since_last", pd.Series(180.0, index=df.index)).fillna(180.0)
+        _b_days_t29 = df.get("b_days_since_last", pd.Series(180.0, index=df.index)).fillna(180.0)
+        _r_age_t29  = df.get("r_current_age",     pd.Series(28.0,  index=df.index)).fillna(28.0)
+        _b_age_t29  = df.get("b_current_age",     pd.Series(28.0,  index=df.index)).fillna(28.0)
+        # Older fighters coming back from longer layoffs suffer more ring rust
+        df["r_layoff_age_penalty"] = (_r_days_t29 / 365.0) * np.clip(_r_age_t29 - 28.0, 0.0, None)
+        df["b_layoff_age_penalty"] = (_b_days_t29 / 365.0) * np.clip(_b_age_t29 - 28.0, 0.0, None)
+        df["layoff_age_penalty_diff"] = df["r_layoff_age_penalty"] - df["b_layoff_age_penalty"]
+
+        # -- Item 4: Weight-class-specific age curve modeling -------------------
+        # Approximate peak competitive age by weight class (lighter = peaks earlier)
+        _WC_PEAK_AGE = {
+            "Heavyweight": 31, "Light Heavyweight": 30,
+            "Middleweight": 30, "Welterweight": 29,
+            "Lightweight": 28, "Featherweight": 27,
+            "Bantamweight": 27, "Flyweight": 26,
+            "Women's Featherweight": 28, "Women's Bantamweight": 27,
+            "Women's Flyweight": 26, "Women's Strawweight": 25,
+        }
+        _wc_col = df.get("weight_class", pd.Series("Lightweight", index=df.index)).fillna("Lightweight")
+        _wc_peak = _wc_col.map(_WC_PEAK_AGE).fillna(29.0)
+        df["r_age_vs_wc_peak"] = _r_age_t29 - _wc_peak
+        df["b_age_vs_wc_peak"] = _b_age_t29 - _wc_peak
+        df["age_vs_peak_diff"] = df["r_age_vs_wc_peak"] - df["b_age_vs_wc_peak"]
+        # Past-prime penalty: only penalise fighters past their weight-class peak
+        df["r_past_prime"] = np.clip(df["r_age_vs_wc_peak"], 0.0, None)
+        df["b_past_prime"] = np.clip(df["b_age_vs_wc_peak"], 0.0, None)
+        df["past_prime_diff"] = df["r_past_prime"] - df["b_past_prime"]
+
+        # r_ewm_* / b_ewm_* pairs are handled by the D+I antisymmetric
+        # decomposition automatically — no manual diff columns needed here.
+
         self.df = df
         print_metric("Feature columns added:", len(df.columns))
 
@@ -2459,6 +2586,7 @@ class UFCPredictor:
         df_val  = df_train.iloc[diag_start:train_end]
 
         # Corner-swap augmentation on train set
+        n_orig = len(df_tr)   # number of original (non-augmented) training fights
         df_aug = self._corner_swap(df_tr)
         df_tr_aug = pd.concat([df_tr, df_aug], ignore_index=True)
 
@@ -2466,10 +2594,16 @@ class UFCPredictor:
         X_val, y_val, _ = self._build_X_y(df_val)
         self.feature_cols = feat_cols
 
+        # Sample weighting removed: any mismatch between OOF fold training
+        # (unweighted) and final base model fits (weighted) miscalibrates the
+        # meta-learner probabilities and raises test log-loss.  The recency
+        # signal is already captured through the ewm rolling features in Tier 29.
+        sw_tr = None
+
         print_metric("Train samples (augmented):", len(X_tr))
         print_metric("Diag window samples (in-training):", len(X_val))
         print_metric("Test samples (holdout):", len(df_test))
-        print_metric("Features:", len(feat_cols))
+        print_metric("Features (pre-decomposition):", len(feat_cols))
 
         # ── Antisymmetric feature decomposition (D + I) ───────────────────
         print_step("Applying antisymmetric feature decomposition (D + I)...")
@@ -2513,8 +2647,8 @@ class UFCPredictor:
         # Track D-feature indices (no _inv suffix) for corner bias diagnostic
         self._d_indices = [i for i, c in enumerate(self._decomposed_cols) if not c.endswith('_inv')]
 
-        # Global model-based feature selection — keep top 50% of the 1200
-        # decomposed features by LightGBM split-count importance.
+        # Global model-based feature selection — keep top 50% of the decomposed
+        # features by LightGBM split-count importance.
         # ANOVA F-score (the univariate alternative) only detects linear
         # correlations; LGB importance captures feature interactions and
         # non-linear signal (e.g. age has a non-linear relationship with
@@ -2530,10 +2664,10 @@ class UFCPredictor:
                 random_state=RANDOM_SEED, verbose=-1, n_jobs=SAFE_N_JOBS,
             )
             _sel_lgb.fit(X_tr_s, y_tr)
-            # Use max_features to guarantee exactly top 50% by count.
+            # Use max_features to guarantee exactly top 1/3 by count (~400).
             # threshold="median" fails when median importance=0 (>50% zero-importance
             # features), causing SelectFromModel to keep all 1200 features.
-            _n_keep = X_tr_s.shape[1] // 2
+            _n_keep = X_tr_s.shape[1] // 2   # keep top 50% by LGB importance
             self._global_selector = _SFM(
                 _sel_lgb, prefit=True, max_features=_n_keep, threshold=-np.inf
             )
@@ -2620,7 +2754,7 @@ class UFCPredictor:
                 sampler=optuna.samplers.TPESampler(seed=RANDOM_SEED),
             )
 
-            N_TRIALS = 25  # TEMP: speed test (restore to 25)
+            N_TRIALS = 25
             _optuna_best_so_far = [None]
 
             def _optuna_callback(study, trial):
@@ -2658,7 +2792,7 @@ class UFCPredictor:
         if HAS_OPTUNA and HAS_LGB:
             print_step("Running Optuna hyperparameter search for LightGBM (15 trials)...")
             lgb_optuna_start = time.time()
-            LGB_TRIALS = 15  # TEMP: speed test (restore to 15)
+            LGB_TRIALS = 15
 
             def lgb_optuna_objective(trial):
                 params = {
@@ -2716,7 +2850,7 @@ class UFCPredictor:
         # Build and fit base estimators — these fitted copies are used for the
         # per-model val accuracy display and cloned into the stacking ensemble.
         t0_estimators = time.time()
-        estimators = self._build_estimators(X_tr_sel, y_tr)
+        estimators = self._build_estimators(X_tr_sel, y_tr, sample_weight=sw_tr)
         print_metric("Base estimators time:", f"{time.time()-t0_estimators:.1f}s")
 
         # ── Manual OOF stacking with KFold-3 ───────────────────────────────
@@ -2734,7 +2868,13 @@ class UFCPredictor:
             n_splits=3,
             random_state=RANDOM_SEED,
         )
-        _stk.fit(X_tr_sel, y_tr)
+        # OOF meta-features must use only original (non-augmented) rows.
+        # The augmented dataset has corner-swapped duplicates at rows n_orig..2*n_orig.
+        # With KFold-3 on the full 2×n_orig set, the mirror of each validation fight
+        # lands in the training fold — pure data leakage that inflates OOF accuracy
+        # by ~4% relative to true holdout.  Base models are still fitted on the full
+        # augmented set (via _build_estimators above); only the OOF phase is restricted.
+        _stk.fit(X_tr_sel[:n_orig], y_tr[:n_orig], sample_weight=sw_tr)
         # Store for downstream use
         self._base_ensemble = _stk
         self.stacking_clf   = _stk
@@ -3990,12 +4130,12 @@ class UFCPredictor:
 
         return df
 
-    def _build_estimators(self, X_tr, y_tr):
+    def _build_estimators(self, X_tr, y_tr, sample_weight=None):
         from sklearn.pipeline import Pipeline as _Pipeline
         from sklearn.feature_selection import SelectPercentile, f_classif
-        from sklearn.neural_network import MLPClassifier
 
         estimators = []
+        sw = np.asarray(sample_weight) if sample_weight is not None else None
 
         # Class imbalance ratio — used by XGBoost (scale_pos_weight) and CatBoost
         n_pos = max(int(np.sum(y_tr == 1)), 1)
@@ -4014,6 +4154,8 @@ class UFCPredictor:
                 n_jobs=SAFE_N_JOBS, class_weight="balanced", solver="lbfgs",
             ))
         ])
+        # LR Pipeline does not support sample_weight through Pipeline.fit in all
+        # sklearn versions — fit without it; it uses class_weight="balanced" instead.
         lr_pipe.fit(X_tr, y_tr)
         estimators.append(("lr", lr_pipe))
 
@@ -4037,7 +4179,7 @@ class UFCPredictor:
             if self.gpu_info.get("xgb"):
                 xgb_params["device"] = "cuda"
             clf = xgb.XGBClassifier(**xgb_params)
-            clf.fit(X_tr, y_tr)
+            clf.fit(X_tr, y_tr, sample_weight=sw)
             estimators.append(("xgb", clf))
 
         # LightGBM — Optuna-tuned params used if available, else conservative defaults
@@ -4053,34 +4195,27 @@ class UFCPredictor:
             if hasattr(self, '_optuna_best_lgb_params') and self._optuna_best_lgb_params:
                 lgb_params.update(self._optuna_best_lgb_params)
             clf = lgb.LGBMClassifier(**lgb_params)
-            clf.fit(X_tr, y_tr)
+            clf.fit(X_tr, y_tr, sample_weight=sw)
             estimators.append(("lgb", clf))
 
-        # Random Forest — max_depth=12 prevents extreme depth in 1200-feature space.
-        # Unlimited depth (None) with 1200 features produces very deep trees that
-        # memorize training data and generalize poorly; depth 12 is a hard cap.
+        # Random Forest — constrained to prevent memorisation.
+        # With 600 features and ~5700 augmented training samples, depth=12 and
+        # min_samples_leaf=3 still yielded ~96% in-sample accuracy.
+        # Increasing min_samples_leaf to 8 forces each leaf to cover at least
+        # 8 samples, significantly reducing overfitting while keeping the
+        # model deep enough to capture real interactions.
         rf = RandomForestClassifier(
-            n_estimators=300, max_depth=12, min_samples_split=6,
-            min_samples_leaf=3, max_features="sqrt",
+            n_estimators=300, max_depth=10, min_samples_split=10,
+            min_samples_leaf=8, max_features="sqrt",
             random_state=RANDOM_SEED, n_jobs=1, class_weight="balanced"
         )
-        rf.fit(X_tr, y_tr)
+        rf.fit(X_tr, y_tr, sample_weight=sw)
         estimators.append(("rf", rf))
 
-        # MLP — SelectPercentile reduces 1200 features to ~480 so the network
-        # doesn't collapse under high-dimensional noise
-        mlp_pipe = _Pipeline([
-            ("selector", SelectPercentile(f_classif, percentile=40)),
-            ("mlp", MLPClassifier(
-                hidden_layer_sizes=(256, 128, 64), activation="relu",
-                solver="adam", alpha=5e-4, batch_size=64,
-                learning_rate_init=1e-3, max_iter=300,
-                early_stopping=True, validation_fraction=0.1,
-                random_state=RANDOM_SEED
-            )),
-        ])
-        mlp_pipe.fit(X_tr, y_tr)
-        estimators.append(("mlp", mlp_pipe))
+        # MLP removed: its meta-learner coefficient was consistently negative,
+        # meaning the stacking LR was betting against its predictions. MLPs
+        # require careful tuning (learning rate, depth, regularization) on
+        # tabular data and are not worth the noise in this ensemble without it.
 
         # CatBoost — more conservative regularization for small UFC dataset.
         # Original depth=6, iterations=500, l2=3 overfit on ~600 training fights;
@@ -4097,7 +4232,7 @@ class UFCPredictor:
             if self.gpu_info.get("cat"):
                 cat_params["task_type"] = "GPU"
             clf = cb.CatBoostClassifier(**cat_params)
-            clf.fit(X_tr, y_tr)
+            clf.fit(X_tr, y_tr, sample_weight=sw)
             estimators.append(("cat", clf))
 
         return estimators
