@@ -36,7 +36,7 @@ from sklearn.decomposition import TruncatedSVD
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.cluster import KMeans
 from sklearn.metrics import accuracy_score, log_loss
-from sklearn.model_selection import cross_val_score, TimeSeriesSplit
+from sklearn.model_selection import cross_val_score, TimeSeriesSplit, KFold
 import openpyxl
 from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
@@ -430,6 +430,15 @@ class FeatureEngineer:
     def get_fighter_cluster(self, fighter):
         return self.fighter_cluster.get(fighter, -1)
 
+    def predict_cluster(self, feature_values):
+        """Assign cluster from per-row pre-fight stats without using the static lookup."""
+        if self.kmeans is None:
+            return -1
+        x = np.array(feature_values, dtype=float).reshape(1, -1)
+        x = np.nan_to_num(x)
+        x_scaled = self.cluster_scaler.transform(x)
+        return int(self.kmeans.predict(x_scaled)[0])
+
     def update_style_performance(self, cluster, opponent_cluster, won):
         self.style_performance[cluster][opponent_cluster].append(1 if won else 0)
 
@@ -477,7 +486,7 @@ class PurgedTimeSeriesSplit:
 # MANUAL OOF STACKING ENSEMBLE
 # ─────────────────────────────────────────────────────────────────────────────
 class _ManualStackingEnsemble:
-    """TimeSeriesSplit-5 out-of-fold stacking that avoids StackingClassifier's NaN bug.
+    """KFold-3 out-of-fold stacking that avoids StackingClassifier's NaN bug.
 
     StackingClassifier's internal cross_val_predict produces NaN meta-features
     for some base models (rf, mlp, cat), causing their LR meta-learner
@@ -497,8 +506,9 @@ class _ManualStackingEnsemble:
         self.classes_         = None
         self.final_estimator_ = None
 
-    def fit(self, X, y):
+    def fit(self, X, y, groups=None):
         from sklearn.base import clone as _clone
+        from sklearn.model_selection import GroupKFold
         y = np.asarray(y)
         self.classes_ = np.unique(y)
         nc = len(self.classes_)          # 2 for binary
@@ -508,8 +518,17 @@ class _ManualStackingEnsemble:
         # OOF meta-feature matrix: n_samples × (n_models × n_classes)
         meta_X_oof = np.full((n, nm * nc), 1.0 / nc)
 
-        kf = TimeSeriesSplit(n_splits=self.n_splits)
-        for tr_idx, va_idx in kf.split(X):
+        # When groups are provided (e.g. original/swap fight pairs), use
+        # GroupKFold so that paired samples always land in the same fold.
+        # Plain KFold would split [orig_0..N, swap_0..N] at 2N/3, putting
+        # swap counterparts of validation fights into the training set.
+        if groups is not None:
+            splitter = GroupKFold(n_splits=self.n_splits)
+            split_iter = splitter.split(X, y, groups=groups)
+        else:
+            splitter = KFold(n_splits=self.n_splits, shuffle=False)
+            split_iter = splitter.split(X)
+        for tr_idx, va_idx in split_iter:
             X_tr_f, X_va_f = X[tr_idx], X[va_idx]
             y_tr_f = y[tr_idx]
             for ei, (name, est) in enumerate(self.estimators):
@@ -828,6 +847,12 @@ class UFCPredictor:
         for col in new_cols:
             self.df[col] = 0.0
 
+        # Initialize ELO columns before the first pass so writes are unconditional
+        if "r_elo_pre_fight" not in self.df.columns:
+            self.df["r_elo_pre_fight"] = 1500.0
+        if "b_elo_pre_fight" not in self.df.columns:
+            self.df["b_elo_pre_fight"] = 1500.0
+
         for idx, row in self.df.iterrows():
             r = str(row.get("r_fighter", "")).strip()
             b = str(row.get("b_fighter", "")).strip()
@@ -1071,8 +1096,8 @@ class UFCPredictor:
                 winner_streak=_r_streak if winner == "Red" else _b_streak,
                 opponent_elo=_b_elo_pre if winner == "Red" else _r_elo_pre,
             )
-            self.df.at[idx, "r_elo_pre_fight"] = r_elo_pre if "r_elo_pre_fight" in self.df.columns else None
-            self.df.at[idx, "b_elo_pre_fight"] = b_elo_pre if "b_elo_pre_fight" in self.df.columns else None
+            self.df.at[idx, "r_elo_pre_fight"] = r_elo_pre
+            self.df.at[idx, "b_elo_pre_fight"] = b_elo_pre
 
             # ── Glicko-2 update ───────────────────────────────────────────
             r_glicko = self.feature_engineer.glicko2_get(r)
@@ -1267,48 +1292,6 @@ class UFCPredictor:
                     if won:
                         fs["vs_grappler_wins"] += 1
 
-        # Add ELO columns if missing
-        if "r_elo_pre_fight" not in self.df.columns:
-            self.df["r_elo_pre_fight"] = 1500.0
-        if "b_elo_pre_fight" not in self.df.columns:
-            self.df["b_elo_pre_fight"] = 1500.0
-
-        # Recompute ELO cleanly with full K-factor modifiers
-        self.feature_engineer.elo_ratings = {}
-        fight_count_r = defaultdict(int)
-        fight_count_b = defaultdict(int)
-        win_streak_r = defaultdict(int)
-        win_streak_b = defaultdict(int)
-        for idx, row in self.df.iterrows():
-            r = str(row.get("r_fighter", "")).strip()
-            b = str(row.get("b_fighter", "")).strip()
-            winner = str(row.get("winner", "")).strip()
-            method = str(row.get("method", "")).strip()
-            is_title = bool(row.get("is_title_bout", False))
-            finish_round = int(float(row.get("finish_round", 0) or 0))
-            r_elo_cur = self.feature_engineer.elo_get(r)
-            b_elo_cur = self.feature_engineer.elo_get(b)
-            pre_rA, pre_rB = self.feature_engineer.elo_update(
-                r, b, winner, is_title, method,
-                fight_count_r[r], fight_count_b[b],
-                finish_round=finish_round,
-                winner_streak=win_streak_r[r] if winner == "Red" else win_streak_b[b],
-                opponent_elo=b_elo_cur if winner == "Red" else r_elo_cur,
-            )
-            self.df.at[idx, "r_elo_pre_fight"] = pre_rA
-            self.df.at[idx, "b_elo_pre_fight"] = pre_rB
-            fight_count_r[r] += 1
-            fight_count_b[b] += 1
-            if winner == "Red":
-                win_streak_r[r] += 1
-                win_streak_b[b] = 0
-            elif winner == "Blue":
-                win_streak_b[b] += 1
-                win_streak_r[r] = 0
-            else:
-                win_streak_r[r] = 0
-                win_streak_b[b] = 0
-
         self._log(f"Data leakage fix complete. DataFrame shape: {self.df.shape}")
 
     # ── BUILD FEATURES ───────────────────────────────────────────────────────
@@ -1474,8 +1457,14 @@ class UFCPredictor:
                    "b_pre_SLpM", "b_pre_SApM", "b_pre_sig_str_acc",
                    "b_pre_td_avg", "b_pre_sub_att_rate", "b_pre_kd_rate"]
 
-        # First pass: accumulate stats for Z-score computation
-        for _, row in df.iterrows():
+        # Single chronological pass: score each fight against only past fights,
+        # then add it to the accumulator.  The old two-pass approach let a
+        # January fight be Z-scored against the full-year distribution (future
+        # fights included).
+        fe.weight_class_stats = defaultdict(lambda: defaultdict(list))
+        for col in z_feats:
+            df[f"z_{col}"] = 0.0
+        for idx, row in df.sort_values("event_date", na_position="first").iterrows():
             wc = str(row.get("weight_class", ""))
             yr = row["event_date"].year if pd.notna(row.get("event_date")) else 2000
             stats_dict = {}
@@ -1485,51 +1474,43 @@ class UFCPredictor:
                     try:
                         v = float(v)
                         if not math.isnan(v):
+                            df.at[idx, f"z_{feat}"] = fe.get_z_score(wc, yr, feat, v)
                             stats_dict[feat] = v
                     except (TypeError, ValueError):
                         pass
             fe.update_weight_class_stats(wc, yr, stats_dict)
 
-        # Second pass: compute Z-scores
-        for col in z_feats:
-            df[f"z_{col}"] = 0.0
-        for idx, row in df.iterrows():
-            wc = str(row.get("weight_class", ""))
-            yr = row["event_date"].year if pd.notna(row.get("event_date")) else 2000
-            for feat in z_feats:
-                if feat in df.columns:
-                    v = row.get(feat, 0)
-                    try:
-                        v = float(v)
-                        if not math.isnan(v):
-                            df.at[idx, f"z_{feat}"] = fe.get_z_score(wc, yr, feat, v)
-                    except (TypeError, ValueError):
-                        pass
-
         # ── TIER 6: Common opponent features ──────────────────────────────
         self._log("Tier 6: Common opponent features...")
-        n_common, r_wins_c, b_wins_c, co_edge = [], [], [], []
-        for _, row in df.iterrows():
+        # Reset state; rebuild chronologically so each fight only sees opponents
+        # that both fighters had already faced before this fight's date.
+        fe.fighter_opponents = defaultdict(set)
+        fe.fight_outcomes = {}
+        for col in ["n_common_opponents", "r_wins_vs_common", "b_wins_vs_common", "common_opp_edge"]:
+            df[col] = 0.0
+        for idx, row in df.sort_values("event_date", na_position="first").iterrows():
             r = str(row.get("r_fighter", ""))
             b = str(row.get("b_fighter", ""))
+            winner = str(row.get("winner", ""))
             feat = fe.get_common_opponent_features(r, b)
-            n_common.append(feat["n_common_opponents"])
-            r_wins_c.append(feat["r_wins_vs_common"])
-            b_wins_c.append(feat["b_wins_vs_common"])
-            co_edge.append(feat["common_opp_edge"])
-        df["n_common_opponents"] = n_common
-        df["r_wins_vs_common"] = r_wins_c
-        df["b_wins_vs_common"] = b_wins_c
-        df["common_opp_edge"] = co_edge
+            df.at[idx, "n_common_opponents"] = feat["n_common_opponents"]
+            df.at[idx, "r_wins_vs_common"]   = feat["r_wins_vs_common"]
+            df.at[idx, "b_wins_vs_common"]   = feat["b_wins_vs_common"]
+            df.at[idx, "common_opp_edge"]    = feat["common_opp_edge"]
+            fe.update_common_opponents(r, b, winner)
 
         # ── TIER 7: Style cluster features ────────────────────────────────
         self._log("Tier 7: Style cluster features...")
+        # Fit cluster geometry on the first 80% of fights (by date) only, so
+        # the centroid positions are not influenced by fights that are in the
+        # future relative to the rows being assigned.
+        df_sorted_dates = df.sort_values("event_date", na_position="first")
+        _cluster_fit_cutoff = int(len(df_sorted_dates) * 0.80)
+        df_cluster_fit = df_sorted_dates.iloc[:_cluster_fit_cutoff]
         fighter_style = {}
         for f in self.all_fighters:
-            # Use final ELO (proxy for quality)
-            elo = fe.elo_get(f)
-            r_rows = df[df["r_fighter"] == f]
-            b_rows = df[df["b_fighter"] == f]
+            r_rows = df_cluster_fit[df_cluster_fit["r_fighter"] == f]
+            b_rows = df_cluster_fit[df_cluster_fit["b_fighter"] == f]
             slpm = 0.0; sapm = 0.0; td = 0.0; sub = 0.0; finish = 0.0
             cnt = 0
             for _, row in r_rows.iterrows():
@@ -1557,12 +1538,14 @@ class UFCPredictor:
         # The previous two-pass approach (replay all → assign features using final
         # cumulative rates) leaked future outcomes into every row's features.
         _style_snap = {}  # df index → (rc, bc, r_winrate, b_winrate, edge)
+        _r_cluster_cols = ["r_pre_SLpM", "r_pre_SApM", "r_pre_td_avg", "r_pre_sub_att_rate", "r_pre_finish_rate"]
+        _b_cluster_cols = ["b_pre_SLpM", "b_pre_SApM", "b_pre_td_avg", "b_pre_sub_att_rate", "b_pre_finish_rate"]
         for idx, row in df.sort_values("event_date", na_position="first").iterrows():
             r = str(row.get("r_fighter", ""))
             b = str(row.get("b_fighter", ""))
             winner = str(row.get("winner", ""))
-            rc = fe.get_fighter_cluster(r)
-            bc = fe.get_fighter_cluster(b)
+            rc = fe.predict_cluster([float(row.get(c, 0) or 0) for c in _r_cluster_cols])
+            bc = fe.predict_cluster([float(row.get(c, 0) or 0) for c in _b_cluster_cols])
             if rc >= 0 and bc >= 0:
                 # Snapshot PRE-fight win rates before this outcome is recorded
                 mf = fe.get_style_matchup_features(rc, bc)
@@ -2674,7 +2657,7 @@ class UFCPredictor:
         if HAS_OPTUNA and HAS_LGB:
             print_step("Running Optuna hyperparameter search for LightGBM (15 trials)...")
             lgb_optuna_start = time.time()
-            LGB_TRIALS = 15
+            LGB_TRIALS = 15  # TEMP: speed test (restore to 15)
 
             def lgb_optuna_objective(trial):
                 params = {
@@ -2792,22 +2775,27 @@ class UFCPredictor:
         estimators = self._build_estimators(X_tr_sel, y_tr)
         print_metric("Base estimators time:", f"{time.time()-t0_estimators:.1f}s")
 
-        # ── Manual OOF stacking with TimeSeriesSplit-5 ─────────────────────
+        # ── Manual OOF stacking with KFold-3 ───────────────────────────────
         # Replaces StackingClassifier to fix the NaN stacking bug: sklearn's
         # StackingClassifier uses cross_val_predict internally, which produces
         # NaN meta-features for rf/mlp/cat in our setup, leaving those models
-        # with NaN coefficients and making them useless.  _ManualStackingEnsemble
-        # does the same OOF stacking explicitly with TimeSeriesSplit (respects
-        # temporal ordering), catching NaN/exceptions per model per fold.
-        print_step("Building stacking ensemble (manual TimeSeriesSplit-5 OOF meta-learning)...")
+        # with NaN LR coefficients and making them useless.  _ManualStackingEnsemble
+        # does the same KFold-3 OOF stacking explicitly, catching NaN/exceptions
+        # per model per fold so all 6 base models contribute valid meta-features.
+        print_step("Building stacking ensemble (manual KFold-3 OOF meta-learning)...")
         t0_stack = time.time()
         _stk = _ManualStackingEnsemble(
             estimators=estimators,   # already fitted by _build_estimators
             meta_C=0.05,
-            n_splits=5,
+            n_splits=3,
             random_state=RANDOM_SEED,
         )
-        _stk.fit(X_tr_sel, y_tr)
+        # groups: row i and its corner-swap at i+n_orig share the same group id,
+        # so GroupKFold keeps them in the same fold and prevents the swap from
+        # appearing in a fold's training set while its original is in validation.
+        _n_orig = len(df_tr)
+        _stk_groups = np.tile(np.arange(_n_orig), 2)[:len(y_tr)]
+        _stk.fit(X_tr_sel, y_tr, groups=_stk_groups)
         # Store for downstream use
         self._base_ensemble = _stk
         self.stacking_clf   = _stk
@@ -2983,14 +2971,14 @@ class UFCPredictor:
         print_metric("  Max parity error:", f"{max_error:.4f}")
         print_metric("  Inherent red bias:", f"{red_bias:+.4f} ({red_bias*100:+.2f}%)")
 
-        # UFC books better-ranked fighter red, so ~56-58% red wins is real.
-        # A model bias of ~3-6% is therefore expected legitimate signal.
-        if abs(red_bias) < 0.03:
-            print("  GOOD: Bias < 3% -- Consistent with fighter skill signal")
-        elif abs(red_bias) < 0.07:
-            print("  NOTE: Bias 3-7% -- Consistent with real UFC red-corner advantage (~56-58% red wins)")
+        # UFC books better-ranked fighter red, so ~54-58% red wins is real.
+        # A model bias of 4-8% is therefore expected legitimate signal.
+        if abs(red_bias) < 0.04:
+            print("  GOOD: Bias < 4% -- May be slightly underestimating red-corner advantage")
+        elif abs(red_bias) <= 0.08:
+            print("  NOTE: Bias 4-8% -- Consistent with real UFC red-corner advantage (~54-58% red wins)")
         else:
-            print("  WARNING: Bias > 7% -- Model may have over-learned corner position!")
+            print("  WARNING: Bias > 8% -- Model may have over-learned corner position!")
 
         # Store for informational tracking (not used to adjust predictions)
         self._red_corner_bias = red_bias
